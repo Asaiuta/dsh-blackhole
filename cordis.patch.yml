@@ -1,0 +1,21 @@
+# dsh-compaction-responses bundle patch: mount the Responses-assisted
+# compaction backend and re-enable the /compact command.
+#
+# A row's `name` (its package identity) is fixed by the bundle that inserted
+# it, so the official backend cannot be re-pointed in place. The patch instead
+# DISABLES the `compaction-basic` row (inserted by @deepseek-ai/dsh-base,
+# already disabled by @deepseek-ai/dsh-web-app — idempotent either way) and
+# INSERTS this package's engine under its own id. The engine subclasses the
+# official BasicCompactionEngine and registers the same `compaction` service,
+# so exactly one engine serves every session.
+- id: compaction-basic
+  disabled: true
+
+# The /compact command is backend-independent ("follows whichever compaction
+# service this leaf mounts"), so re-enabling it is safe with any engine.
+- id: command-compact
+  disabled: false
+
+- insert:
+    - id: dsh-compaction-responses
+      name: dsh-compaction-responses
