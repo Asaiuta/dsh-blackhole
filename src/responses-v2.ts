@@ -72,6 +72,8 @@ function truncateMessageToTokenBudget(item: ResponseItem, maxTokens: number): Re
   if (item.type !== 'message' || !Array.isArray(item.content)) return { ...item }
   let remainingCharacters = Math.max(0, maxTokens * 4)
   const content = item.content.flatMap((part) => {
+    // Images are exempt from the character budget, like the upstream port.
+    if (part.type === 'input_image') return [part]
     if (remainingCharacters === 0) return []
     const text = (part.text ?? '').slice(0, remainingCharacters)
     remainingCharacters -= text.length
@@ -93,8 +95,10 @@ export function buildReplacementHistory(
   if (compactionItem.type !== 'compaction') {
     throw new Error('OpenAI remote compaction v2 did not return a compaction item.')
   }
+  // Non-empty user messages only, newest realization wins — same retention
+  // rule as the upstream port.
   const retainedUserMessages = input.filter(
-    (item) => item.type === 'message' && item.role === 'user',
+    (item) => item.type === 'message' && item.role === 'user' && isRealUserMessage(item),
   )
   let remainingTokens = retainedMessageTokenBudget
   const retainedReversed: ResponseItem[] = []
@@ -118,22 +122,22 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
   const items: ResponseItem[] = []
 
   if (message.role === 'user' || message.role === 'system') {
-    const textParts: string[] = []
+    const contentItems: ResponseContentItem[] = []
     const toolOutputs: ResponseItem[] = []
     for (const block of message.content) {
       switch (block.type) {
         case 'text':
-          textParts.push(block.text)
+          contentItems.push({ type: 'input_text', text: block.text })
           break
         case 'image':
           // DSH stores image bytes in the attachment store; a compaction call
           // cannot resolve them here, so the visit is recorded as text.
-          textParts.push(IMAGE_CONTENT_OMITTED_PLACEHOLDER)
+          contentItems.push({ type: 'input_text', text: IMAGE_CONTENT_OMITTED_PLACEHOLDER })
           break
         case 'tool-result':
           toolOutputs.push({
             type: 'function_call_output',
-            call_id: block.toolCallId,
+            call_id: String(block.toolCallId).split('|', 1)[0],
             output: toolResultBlockToOutput(block.content),
           })
           break
@@ -141,9 +145,8 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
           break
       }
     }
-    const text = textParts.join('').trim()
-    if (text.length > 0) {
-      items.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] })
+    if (contentItems.length > 0) {
+      items.push({ type: 'message', role: 'user', content: contentItems })
     }
     items.push(...toolOutputs)
     return items
@@ -178,7 +181,7 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
           items.push({
             type: 'function_call',
             name: block.name,
-            call_id: block.id,
+            call_id: String(block.id).split('|', 1)[0],
             arguments: typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments ?? {}),
           })
           break
@@ -200,7 +203,11 @@ function toolResultBlockToOutput(content: readonly ContentBlock[]): string {
     .trim()
 }
 
-/** Convert a DSH message list into the Responses input for compaction. */
+function isRealUserMessage(item: ResponseItem): boolean {
+  if (item.type !== 'message' || item.role !== 'user') return false
+  if (typeof item.content === 'string') return item.content.trim().length > 0
+  return Array.isArray(item.content) && item.content.length > 0
+}
 export function dshMessagesToResponseItems(messages: readonly Message[]): ResponseItem[] {
   return messages.flatMap((message) => dshMessageToResponseItems(message))
 }
@@ -228,6 +235,7 @@ export function buildCompactionRequestBody(params: {
     input: [...params.input, { type: 'compaction_trigger' }],
     ...(params.instructions ? { instructions: params.instructions } : {}),
     tools: params.tools,
+    parallel_tool_calls: true,
     tool_choice: 'auto',
     stream: true,
     store: false,
@@ -275,7 +283,7 @@ interface ParsedCompactionStream {
 export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStream {
   let completed = false
   let usage: unknown
-  let compactionItem: ResponseItem | undefined
+  const compactionItems: ResponseItem[] = []
   const summaryChunks: string[] = []
 
   for (const event of events) {
@@ -292,7 +300,7 @@ export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStre
     }
     if (event.type === 'response.output_item.done' && isResponseItem(event.item)) {
       if (event.item.type === 'compaction') {
-        compactionItem = event.item
+        compactionItems.push(event.item)
         continue
       }
       if (event.item.type === 'message' && event.item.role === 'assistant' &&
@@ -317,8 +325,13 @@ export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStre
   if (!completed) {
     throw new Error('OpenAI remote compaction v2 stream ended before response.completed.')
   }
+  if (compactionItems.length !== 1) {
+    throw new Error(
+      `OpenAI remote compaction v2 expected exactly one compaction item, got ${compactionItems.length}.`,
+    )
+  }
   return {
-    compactionItem,
+    compactionItem: compactionItems[0],
     summaryText: summaryChunks.join('').trim(),
     usage,
   }
@@ -338,10 +351,16 @@ export function mapCompactionUsage(value: unknown): TokenUsage | undefined {
   const cachedTokens = typeof details?.cached_tokens === 'number' && Number.isFinite(details.cached_tokens)
     ? details.cached_tokens
     : 0
+  const cacheWriteTokens = typeof details?.cache_creation_tokens === 'number' && Number.isFinite(details.cache_creation_tokens)
+    ? details.cache_creation_tokens
+    : (typeof details?.cache_write_tokens === 'number' && Number.isFinite(details.cache_write_tokens)
+      ? details.cache_write_tokens
+      : 0)
   return {
-    inputTokens: Math.max(0, inputTokens - cachedTokens),
+    inputTokens: Math.max(0, inputTokens - cachedTokens - cacheWriteTokens),
     outputTokens,
     ...(cachedTokens > 0 ? { cacheReadTokens: cachedTokens } : {}),
+    ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
   }
 }
 
@@ -362,8 +381,10 @@ export async function callResponsesCompactionV2(params: {
   signal?: AbortSignal
   timeoutMs: number
   retainedMessageTokenBudget: number
+  /** Codex installation id; sent as `x-codex-installation-id` (+ window/session headers) when provided. */
+  installationId?: string
 }): Promise<RemoteCompactionV2Result> {
-  const { endpoint, apiKey, model, input, instructions, tools, sessionId, signal, timeoutMs, retainedMessageTokenBudget } = params
+  const { endpoint, apiKey, model, input, instructions, tools, sessionId, signal, timeoutMs, retainedMessageTokenBudget, installationId } = params
   const url = `${endpoint.baseUrl.replace(/\/+$/, '')}/responses`
 
   const timeoutSignal = timeoutMs > 0
@@ -373,13 +394,35 @@ export async function callResponsesCompactionV2(params: {
     ? AbortSignal.any([signal, timeoutSignal])
     : (signal ?? timeoutSignal)
 
+  // The upstream port sends x-codex-beta-features on EVERY remote compaction
+  // request, merging any endpoint-provided feature list; identity headers are
+  // separate and opt-out-able.
+  const userHeaders = { ...endpoint.headers }
+  const betaKey = Object.keys(userHeaders).find((key) => key.toLowerCase() === 'x-codex-beta-features')
+  const userBeta = betaKey !== undefined
+    ? String(userHeaders[betaKey]).split(',').map((f) => f.trim()).filter(Boolean)
+    : []
+  if (betaKey !== undefined) delete userHeaders[betaKey]
+  const betaFeatures = [...new Set([...userBeta, 'remote_compaction_v2'])].join(',')
+
+  const identityHeaders = endpoint.sendIdentityHeaders && installationId
+    ? {
+      'x-codex-installation-id': installationId,
+      ...(sessionId !== undefined
+        ? { 'x-codex-window-id': `${sessionId}:0`, session_id: sessionId }
+        : {}),
+    }
+    : {}
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${apiKey}`,
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      ...endpoint.headers,
+      ...identityHeaders,
+      ...userHeaders,
+      'x-codex-beta-features': betaFeatures,
     },
     body: JSON.stringify(buildCompactionRequestBody({ model, input, instructions, tools, sessionId })),
     signal: requestSignal,

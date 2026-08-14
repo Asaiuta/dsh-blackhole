@@ -16,6 +16,8 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
@@ -117,6 +119,31 @@ function defaultStateDir(): string {
 }
 
 /**
+ * The persisted random installation id sent as `x-codex-installation-id`,
+ * mirroring the upstream port's identity behavior without ever touching the
+ * real Codex home (~/.codex). Resolved lazily, so a read-only stateDir just
+ * omits the header.
+ */
+function resolveInstallationId(stateDir: string): string | undefined {
+  const file = join(stateDir, '..', 'installation_id')
+  try {
+    if (existsSync(file)) {
+      const existing = readFileSync(file, 'utf8').trim()
+      if (/^[0-9a-fA-F-]{36}$/.test(existing)) return existing.toLowerCase()
+    }
+    const installationId = randomUUID()
+    try {
+      writeFileSync(file, installationId)
+    } catch {
+      // Header is a parity hint, not a reason to fail compaction.
+    }
+    return installationId
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * The Responses-assisted compaction engine.
  *
  * Same service identity as the official backend (`compaction`); the bundle
@@ -134,6 +161,8 @@ export class ResponsesCompactionEngine extends BasicCompactionEngine {
   readonly state: RemoteCompactionStateStore | undefined
   /** The plugin's own validated config (base fields live in `this.config`). */
   private readonly options: CompactionResponsesConfig
+  /** Persisted Codex-style installation id, resolved lazily. */
+  private installationId: string | undefined
 
   constructor(ctx: Context, config: CompactionResponsesConfig = {}) {
     // The inherited resolveConfig() rejects unknown keys, so hand it only the
@@ -145,9 +174,15 @@ export class ResponsesCompactionEngine extends BasicCompactionEngine {
     super(ctx, baseConfig)
     this.options = config
     this.endpoints = resolveEndpoints(endpoints)
-    this.state = persistRemoteHistory !== false
-      ? new RemoteCompactionStateStore(stateDir?.trim() || defaultStateDir())
+    const resolvedStateDir = persistRemoteHistory !== false
+      ? (stateDir?.trim() || defaultStateDir())
       : undefined
+    this.state = resolvedStateDir !== undefined
+      ? new RemoteCompactionStateStore(resolvedStateDir)
+      : undefined
+    this.installationId = config.installationId !== undefined
+      ? (config.installationId.trim() || undefined)
+      : (resolvedStateDir !== undefined ? resolveInstallationId(resolvedStateDir) : undefined)
   }
 
   /** Pick the endpoint serving this provider/model, exact provider first. */
@@ -225,6 +260,7 @@ export class ResponsesCompactionEngine extends BasicCompactionEngine {
         signal,
         timeoutMs: this.options.timeoutMs ?? 120000,
         retainedMessageTokenBudget: this.options.retainedMessageTokenBudget ?? 20000,
+        installationId: this.options.installationId ?? this.installationId,
       })
 
       if (result.summaryText.length === 0) {

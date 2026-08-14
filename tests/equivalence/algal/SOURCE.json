@@ -1,0 +1,8 @@
+{
+  "repo": "algal/pi-openai-server-compaction",
+  "ref": "main",
+  "commit": "8a3de2f3b0c178fdd6f73f2f94172dfc3943e466",
+  "commitDate": "2026-07-23T17:15:58Z",
+  "files": ["src/remote-compaction.ts", "src/openai.ts", "src/config.ts"],
+  "note": "Snapshot of the upstream source used by the differential equivalence tests. Re-verify against a newer commit if the upstream protocol changes."
+}

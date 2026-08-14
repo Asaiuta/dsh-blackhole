@@ -125,7 +125,38 @@ pnpm run typecheck   # tsc --noEmit against the rc.6 packages
 pnpm run build       # esbuild → lib/index.js
 node tests/smoke-load.mjs      # loader composition mounts the engine
 node tests/protocol-smoke.mjs  # conversion/SSE/round-trip vs a local fake endpoint
+node tests/equivalence/build-algal.mjs && node tests/equivalence/differential.mjs
+                               # protocol equivalence vs the REAL upstream bundle
 ```
+
+## Equivalence to the upstream port
+
+`tests/equivalence/` snapshots the upstream source at a pinned commit
+(`algal/SOURCE.json`) and bundles it with pi dependencies stubbed (only the
+computation helpers are replaced; the protocol code runs unmodified). The
+differential test then feeds identical vectors to both implementations:
+request body, replacement history (retention, 20K truncation, image
+exemption, empty-message filtering), SSE parsing (success + every error
+path), message conversion (pi↔DSH semantic projection), identity headers,
+and a full local-endpoint round trip. **15/15 vectors pass.**
+
+Differences that remain are platform adaptation, not protocol drift:
+
+- **Eligibility detection**: upstream auto-detects direct OpenAI / Codex
+  models from the pi-ai registry (host must be `api.openai.com`); this port
+  matches a declared `responsesEndpoints` (provider + model glob), so it can
+  also target your own gateway. The upstream host gate would reject exactly
+  the deployments this plugin is for.
+- **Checkpoint text source**: upstream runs a parallel local summary and
+  stores the remote artifact as `details.remoteCompaction` (pi has that
+  slot); DSH's `summarize()` returns one text, so this port surfaces the
+  server-side summary text as the checkpoint and falls back to the native
+  LLM summarizer on any remote failure. One LLM call instead of two.
+- **Images**: pi carries image bytes (→ `input_image`); DSH only has
+  attachment ids, so image visits become explicit placeholder text.
+- **Exposed knobs**: `retainedMessageTokenBudget` (upstream's fixed 20K),
+  `timeoutMs`, `sendIdentityHeaders`, `installationId` are extra options;
+  defaults reproduce upstream behavior exactly.
 
 ## License
 

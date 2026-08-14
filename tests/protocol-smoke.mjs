@@ -33,7 +33,7 @@ const messages = [
 const items = dshMessagesToResponseItems(messages)
 assert.equal(items[0].type, 'message')
 assert.match(items[0].content[0].text, /^Fix the bug in parser/)
-assert.match(items[0].content[0].text, /image content omitted/)
+assert.match(items[0].content[1].text, /image content omitted/)
 assert.equal(items[1].type, 'reasoning')
 assert.equal(items[2].type, 'message')
 assert.equal(items[2].content[0].text, 'Found it')

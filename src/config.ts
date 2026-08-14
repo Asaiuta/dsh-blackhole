@@ -49,6 +49,13 @@ export interface ResponsesEndpointConfig {
    * `x-codex-beta-features`). The authorization header is added automatically.
    */
   headers?: Record<string, string>
+  /**
+   * Send the Codex identity headers (`x-codex-installation-id` and, when a
+   * session id is known, `x-codex-window-id` + `session_id`) like the upstream
+   * port does. The installation id is a persisted random UUID kept out of the
+   * real Codex home. Default true.
+   */
+  sendIdentityHeaders?: boolean
 }
 
 /** Resolved endpoint: config validated + label/defaults applied. */
@@ -155,6 +162,12 @@ export interface CompactionResponsesConfig {
   stateDir?: string
   persistRemoteHistory?: boolean
   retainedMessageTokenBudget?: number
+  /**
+   * The persisted random installation id sent as `x-codex-installation-id`;
+   * resolved lazily and written next to the state dir. Set to empty string to
+   * disable (equivalent to `sendIdentityHeaders: false` on every endpoint).
+   */
+  installationId?: string
 }
 
 /** Normalize the baseUrl into the exact URL the request goes to. */
@@ -187,6 +200,7 @@ export function resolveEndpoints(
       apiKey: endpoint.apiKey,
       label: endpoint.label?.trim() || host,
       headers: endpoint.headers ?? {},
+      sendIdentityHeaders: endpoint.sendIdentityHeaders !== false,
     }
   })
 }
