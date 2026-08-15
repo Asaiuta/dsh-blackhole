@@ -9,6 +9,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
@@ -17,14 +18,14 @@ import SessionStore from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import Engine from '../lib/index.js'
 
-const root = await mkdtemp(join(tmpdir(), 'dsh-compaction-responses-'))
+const root = await mkdtemp(join(tmpdir(), 'dsh-blackhole-'))
 const configPath = join(root, 'cordis.yml')
 await writeFile(configPath, `[
   { id: llm, name: '@deepseek-ai/dsh-llm' },
   { id: session, name: '@deepseek-ai/dsh-session' },
   { id: token-meter, name: '@deepseek-ai/dsh-token-meter' },
   { id: timer, name: '@deepseek-ai/cordis-plugin-timer' },
-  { id: dsh-compaction-responses, name: dsh-compaction-responses, config: {
+  { id: dsh-blackhole, name: dsh-blackhole, config: {
     endpoints: [
       { provider: 'openai', baseUrl: 'https://api.openai.com/v1', apiKeyEnv: 'OPENAI_API_KEY' },
       { provider: '*', model: '*', baseUrl: 'https://gateway.example.com/v1', apiKeyEnv: 'MY_GW_KEY' }
@@ -44,7 +45,7 @@ const modules = new Map([
   ['@deepseek-ai/dsh-llm', LlmRuntime],
   ['@deepseek-ai/dsh-session', SessionStore],
   ['@deepseek-ai/dsh-token-meter', TokenMeter],
-  ['dsh-compaction-responses', Engine],
+  ['dsh-blackhole', Engine],
 ])
 context.loader.internal = {
   version: 'v2',
@@ -71,6 +72,24 @@ if (!(engine instanceof Engine)) {
 console.log(`OK: ctx.compaction → ${engine.constructor.name}`)
 console.log(`    endpoints: ${JSON.stringify(engine.endpoints.map((e) => e.label))}`)
 console.log(`    stateDir: ${engine.state?.dir ?? '(disabled)'}`)
+assert.equal(typeof context.get('responsesCompactionReplay')?.replayHistory, 'function')
+console.log('OK: adapter-facing Responses replay service is provided')
+
+// The optional dsh-tools service may be loaded after the compaction engine.
+// Verify the engine's service observer registers recall then releases it when
+// the late provider disappears, without making dsh-tools a hard dependency.
+let recallRegistered = false
+let recallUnregistered = 0
+const removeTools = context.provide('tools', {
+  register(definition) {
+    recallRegistered = definition.name === 'recall'
+    return () => { recallUnregistered += 1 }
+  },
+})
+assert.equal(recallRegistered, true)
+removeTools()
+assert.equal(recallUnregistered, 1)
+console.log('OK: late dsh-tools service mounts and disposes recall')
 
 await context.fiber.dispose()
 await rm(root, { recursive: true, force: true })

@@ -12,7 +12,7 @@
  * Protocol and retention logic derived from algal/pi-openai-server-compaction
  * (MIT) — see LICENSE.
  *
- * @module dsh-compaction-responses/responses-v2
+ * @module dsh-blackhole/responses-v2
  */
 
 import type { ContentBlock, Message, TokenUsage, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -52,6 +52,77 @@ export interface RemoteCompactionV2Result {
   replacementHistory: ResponseItem[]
   /** Provider-reported usage, mapped onto DSH's TokenUsage shape. */
   usage?: TokenUsage
+  /** Versioned provider-private details for the next same-model request. */
+  details: RemoteCompactionDetails
+}
+
+/** Portable checkpoint text for the official compaction-only response shape. */
+export function buildRemoteCompactionSummaryText(params: {
+  provider: string
+  model: string
+  endpoint: string
+}): string {
+  return `Remote Responses compaction applied for ${params.provider}/${params.model} via ${params.endpoint}. ` +
+    'Provider-native replacement history is retained for compatible future requests; use recall for omitted details.'
+}
+
+/**
+ * Durable, adapter-owned replay facts.  The readable summary remains in the
+ * DSH checkpoint; this record is only for a compatible Responses adapter.
+ */
+export interface RemoteCompactionDetails {
+  readonly version: 2
+  readonly provider: 'openai-responses-compaction'
+  readonly implementation: 'responses_compaction_v2'
+  readonly modelKey: string
+  readonly replacementHistory: ResponseItem[]
+  readonly usage?: TokenUsage
+}
+
+export function remoteCompactionModelKey(provider: string, model: string): string {
+  return `${provider}:openai-responses:${model}`
+}
+
+/** Build a detached, versioned detail record after protocol validation. */
+export function buildRemoteCompactionDetails(params: {
+  provider: string
+  model: string
+  replacementHistory: ResponseItem[]
+  usage?: TokenUsage
+}): RemoteCompactionDetails {
+  return {
+    version: 2,
+    provider: 'openai-responses-compaction',
+    implementation: 'responses_compaction_v2',
+    modelKey: remoteCompactionModelKey(params.provider, params.model),
+    replacementHistory: params.replacementHistory.map((item) => ({ ...item })),
+    ...(params.usage === undefined ? {} : { usage: { ...params.usage } }),
+  }
+}
+
+function isTokenUsage(value: unknown): value is TokenUsage {
+  if (!isRecord(value)) return false
+  return typeof value.inputTokens === 'number' && Number.isFinite(value.inputTokens) &&
+    typeof value.outputTokens === 'number' && Number.isFinite(value.outputTokens)
+}
+
+/** Fail-closed runtime validation for details loaded from durable storage. */
+export function parseRemoteCompactionDetails(value: unknown): RemoteCompactionDetails | undefined {
+  if (!isRecord(value) || value.version !== 2 || value.provider !== 'openai-responses-compaction' ||
+    value.implementation !== 'responses_compaction_v2' || typeof value.modelKey !== 'string' ||
+    value.modelKey.length === 0 || !Array.isArray(value.replacementHistory) || value.replacementHistory.length === 0) {
+    return undefined
+  }
+  if (!value.replacementHistory.every(isReplayableResponseItem)) return undefined
+  if (value.usage !== undefined && !isTokenUsage(value.usage)) return undefined
+  return {
+    version: 2,
+    provider: 'openai-responses-compaction',
+    implementation: 'responses_compaction_v2',
+    modelKey: value.modelKey,
+    replacementHistory: value.replacementHistory.map((item) => ({ ...item })),
+    ...(value.usage === undefined ? {} : { usage: value.usage }),
+  }
 }
 
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER =
@@ -198,7 +269,12 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
 
 function toolResultBlockToOutput(content: readonly ContentBlock[]): string {
   return content
-    .map((block) => block.type === 'text' ? block.text : '')
+    .map((block) => {
+      if (block.type === 'text') return block.text
+      if (block.type === 'image') return '[image]'
+      return `[${String(block.type)}]`
+    })
+    .filter(Boolean)
     .join('\n')
     .trim()
 }
@@ -210,6 +286,42 @@ function isRealUserMessage(item: ResponseItem): boolean {
 }
 export function dshMessagesToResponseItems(messages: readonly Message[]): ResponseItem[] {
   return messages.flatMap((message) => dshMessageToResponseItems(message))
+}
+
+/**
+ * Rebuild the explicit Responses history for one compatible target.  The
+ * trailing surface is grouped by completed assistant turns exactly like the
+ * upstream port: pending user/tool items are retained only when the matching
+ * assistant response is present, and foreign-model assistant turns are
+ * discarded so provider-private signatures cannot cross model ownership.
+ */
+export function reconstructRemoteCompactionHistory(params: {
+  details: RemoteCompactionDetails
+  provider: string
+  model: string
+  trailingMessages: readonly Message[]
+  /** Include a final incomplete user/tool turn for an ordinary request. */
+  includePending?: boolean
+}): ResponseItem[] | undefined {
+  if (params.details.modelKey !== remoteCompactionModelKey(params.provider, params.model)) return undefined
+  const trailing: ResponseItem[] = []
+  let pending: ResponseItem[] = []
+  for (const message of params.trailingMessages) {
+    if (message.source.kind === 'plugin' && message.source.plugin === 'compact') continue
+    const items = dshMessageToResponseItems(message)
+    if (items.length === 0) continue
+    if (message.role === 'assistant') {
+      const source = message.source.kind === 'model' ? message.source : undefined
+      if (source?.provider === params.provider && source.model === params.model) {
+        trailing.push(...pending, ...items)
+      }
+      pending = []
+      continue
+    }
+    pending.push(...items)
+  }
+  if (params.includePending === true) trailing.push(...pending)
+  return [...params.details.replacementHistory.map((item) => ({ ...item })), ...trailing]
 }
 
 /** Port DSH tool schemas into Responses function tools. */
@@ -272,6 +384,18 @@ function isResponseItem(value: unknown): value is ResponseItem {
   return isRecord(value) && typeof value.type === 'string'
 }
 
+/** The only item forms this package can safely send back during replay. */
+function isReplayableResponseItem(value: unknown): value is ResponseItem {
+  if (!isRecord(value)) return false
+  if (value.type === 'compaction') return typeof value.encrypted_content === 'string'
+  if (value.type !== 'message' || typeof value.role !== 'string' || !Array.isArray(value.content)) return false
+  return value.content.every((content) => {
+    if (!isRecord(content) || typeof content.type !== 'string') return false
+    if (content.type === 'input_image') return typeof content.image_url === 'string'
+    return (content.type === 'input_text' || content.type === 'output_text') && typeof content.text === 'string'
+  })
+}
+
 interface ParsedCompactionStream {
   compactionItem?: ResponseItem
   /** Assistant output text accumulated across the whole compaction response. */
@@ -284,7 +408,9 @@ export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStre
   let completed = false
   let usage: unknown
   const compactionItems: ResponseItem[] = []
-  const summaryChunks: string[] = []
+  const itemSummaryChunks: string[] = []
+  const outputTextDoneChunks: string[] = []
+  const outputTextDeltaChunks: string[] = []
 
   for (const event of events) {
     if (!isRecord(event)) continue
@@ -306,13 +432,17 @@ export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStre
       if (event.item.type === 'message' && event.item.role === 'assistant' &&
         Array.isArray(event.item.content)) {
         for (const content of event.item.content) {
-          if (content.type === 'output_text') summaryChunks.push(content.text)
+          if (content.type === 'output_text') itemSummaryChunks.push(content.text)
         }
       }
       continue
     }
     if (event.type === 'response.output_text.done' && typeof event.text === 'string') {
-      summaryChunks.push(event.text)
+      outputTextDoneChunks.push(event.text)
+      continue
+    }
+    if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+      outputTextDeltaChunks.push(event.delta)
       continue
     }
     if (event.type === 'response.completed') {
@@ -332,7 +462,13 @@ export function parseCompactionV2Events(events: unknown[]): ParsedCompactionStre
   }
   return {
     compactionItem: compactionItems[0],
-    summaryText: summaryChunks.join('').trim(),
+    // Responses streams may expose the same text through both the completed
+    // output item and `response.output_text.done`. Prefer the item payload and
+    // use the latter only for providers that omit the item content; otherwise
+    // a valid summary becomes `HelloHello`.
+    summaryText: (itemSummaryChunks.length > 0
+      ? itemSummaryChunks
+      : outputTextDoneChunks.length > 0 ? outputTextDoneChunks : outputTextDeltaChunks).join('').trim(),
     usage,
   }
 }
@@ -373,6 +509,8 @@ export function mapCompactionUsage(value: unknown): TokenUsage | undefined {
 export async function callResponsesCompactionV2(params: {
   endpoint: ResolvedResponsesEndpoint
   apiKey: string
+  /** DSH provider route that owns the target model. */
+  provider?: string
   model: string
   input: ResponseItem[]
   instructions?: string
@@ -384,8 +522,9 @@ export async function callResponsesCompactionV2(params: {
   /** Codex installation id; sent as `x-codex-installation-id` (+ window/session headers) when provided. */
   installationId?: string
 }): Promise<RemoteCompactionV2Result> {
-  const { endpoint, apiKey, model, input, instructions, tools, sessionId, signal, timeoutMs, retainedMessageTokenBudget, installationId } = params
-  const url = `${endpoint.baseUrl.replace(/\/+$/, '')}/responses`
+  const { endpoint, apiKey, provider, model, input, instructions, tools, sessionId, signal, timeoutMs, retainedMessageTokenBudget, installationId } = params
+  const baseUrl = endpoint.baseUrl.replace(/\/+$/, '')
+  const url = baseUrl.endsWith('/responses') ? baseUrl : `${baseUrl}/responses`
 
   const timeoutSignal = timeoutMs > 0
     ? AbortSignal.timeout(timeoutMs)
@@ -439,9 +578,16 @@ export async function callResponsesCompactionV2(params: {
     throw new Error('Responses compaction v2 returned no compaction item.')
   }
 
+  const replacementHistory = buildReplacementHistory(input, parsed.compactionItem, retainedMessageTokenBudget)
   return {
     summaryText: parsed.summaryText,
-    replacementHistory: buildReplacementHistory(input, parsed.compactionItem, retainedMessageTokenBudget),
+    replacementHistory,
     usage: mapCompactionUsage(parsed.usage),
+    details: buildRemoteCompactionDetails({
+      provider: provider ?? endpoint.provider,
+      model,
+      replacementHistory,
+      usage: mapCompactionUsage(parsed.usage),
+    }),
   }
 }

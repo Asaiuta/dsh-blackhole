@@ -1,0 +1,8 @@
+Pinned reference sources from pi-blackhole (https://github.com/k0valik/pi-blackhole),
+commit 49ab560156fd53b6da1b568d5ade10287b89026c, MIT licensed.
+
+These files are bundled verbatim (type-only pi-ai imports are erased at build
+time) solely as the reference compiler for the content-level differential
+suite (differential-brief.mjs / differential-real-session.mjs). They are not
+part of the runtime package. See https://github.com/k0valik/pi-blackhole for
+the canonical sources and its license.

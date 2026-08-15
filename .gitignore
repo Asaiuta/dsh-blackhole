@@ -2,3 +2,6 @@ node_modules/
 smoke-patch.yml
 *.tgz.diff-labs/
 tests/equivalence/algal-bundle.mjs
+
+tests/equivalence/.eval-out.json
+tests/equivalence/blackhole-brief-bundle.mjs

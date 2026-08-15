@@ -1,7 +1,7 @@
 {
-  "name": "dsh-compaction-responses",
-  "description": "Codex-style remote compaction for DeepSeek Harness: a Responses-API compaction v2 backend that delegates summarization to the model server (OpenAI Responses / compatible gateways) while keeping the readable checkpoint DSH needs, with graceful fallback to the native LLM summarizer.",
-  "version": "0.1.0",
+  "name": "dsh-blackhole",
+  "description": "Dual-pipeline compaction for DeepSeek Harness: official server-side Responses compaction v2 for OpenAI-routed targets, with a deterministic VCC-style local compiler (zero model calls) as the default fallback and for every other provider.",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -84,10 +84,10 @@
   "author": "Asaiuta <asaiuta@users.noreply.github.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Asaiuta/dsh-compaction-responses.git"
+    "url": "git+https://github.com/Asaiuta/dsh-blackhole.git"
   },
-  "homepage": "https://github.com/Asaiuta/dsh-compaction-responses",
+  "homepage": "https://github.com/Asaiuta/dsh-blackhole",
   "bugs": {
-    "url": "https://github.com/Asaiuta/dsh-compaction-responses/issues"
+    "url": "https://github.com/Asaiuta/dsh-blackhole/issues"
   }
 }

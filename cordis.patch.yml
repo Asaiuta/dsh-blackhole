@@ -1,4 +1,4 @@
-# dsh-compaction-responses bundle patch: mount the Responses-assisted
+# dsh-blackhole bundle patch: mount the Responses-assisted
 # compaction backend and re-enable the /compact command.
 #
 # A row's `name` (its package identity) is fixed by the bundle that inserted
@@ -17,5 +17,5 @@
   disabled: false
 
 - insert:
-    - id: dsh-compaction-responses
-      name: dsh-compaction-responses
+    - id: dsh-blackhole
+      name: dsh-blackhole

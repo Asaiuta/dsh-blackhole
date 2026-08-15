@@ -1,5 +1,5 @@
 /**
- * ESM host build for dsh-compaction-responses.
+ * ESM host build for dsh-blackhole.
  *
  * The host half is plain ESM for Node, externalizing the @deepseek-ai/dsh-*
  * profile packages (the profile's node_modules provides them at load time).
