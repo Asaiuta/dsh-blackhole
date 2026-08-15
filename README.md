@@ -1,5 +1,7 @@
 # dsh-blackhole
 
+**English** | [简体中文](README.zh-CN.md)
+
 A DSH port of [`k0valik/pi-blackhole`](https://github.com/k0valik/pi-blackhole)'s
 brief compiler (VCC conversation-compiler), wrapped in a dual-pipeline
 compaction engine.
