@@ -1,9 +1,8 @@
 # dsh-blackhole
 
-**pi-blackhole 的 DeepSeek Harness 移植版** — a DSH port of
-[`k0valik/pi-blackhole`](https://github.com/k0valik/pi-blackhole)'s brief
-compiler (VCC conversation-compiler), wrapped in a dual-pipeline compaction
-engine.
+A DSH port of [`k0valik/pi-blackhole`](https://github.com/k0valik/pi-blackhole)'s
+brief compiler (VCC conversation-compiler), wrapped in a dual-pipeline
+compaction engine.
 
 Drop-in replacement for the official `@deepseek-ai/dsh-compaction-basic`
 backend that routes inside the single `summarize()` hook:

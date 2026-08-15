@@ -1,70 +1,82 @@
-# 内容丢失审计(真实会话)与对回答准确性的影响
+# Content-loss audit (real session) and impact on answer accuracy
 
-基于本机一段真实 pi 会话(285 消息 / 1.45MB JSONL,
-见 `differential-real-session.mjs` 的默认路径;可用 `DSH_EVAL_SESSION` 指向任意
-会话文件),实测压缩器的信息保留与 LLM 回答准确性代价。
+Measured on a real pi session transcript (285 messages / 1.45MB JSONL; see
+the default path in `differential-real-session.mjs`, override with
+`DSH_EVAL_SESSION`): how much information compaction retains, and what it
+costs a model asked to answer from the brief instead of the full context.
 
-## 1. 压缩率与"丢失"构成
+## 1. Compression ratio and what "loss" consists of
 
-| 输入部分 | 字符 | 占比 | 压缩后 |
+| Input part | chars | share | after compaction |
 |---|---|---|---|
-| 工具结果 + 工具参数 | 659,014 | 72.0% | **省略**,仅留 `* tool "arg" (seq N)` 指针 |
-| thinking(推理) | 232,904 | 25.4% | **省略**(设计行为,blackhole 同样省略) |
-| assistant 文本 | 23,216 | 2.5% | 保留 ~93.5%,尾部截断 |
-| user 文本 | 179 | 0.02% | 全保留 |
-| 合计 | 915,313 | | 输出 21.9K(bh)/24.2K(本包) |
+| tool results + tool args | 659,014 | 72.0% | **dropped**, only `* tool "arg" (seq N)` pointers remain |
+| thinking (reasoning) | 232,904 | 25.4% | **dropped** (by design; pi-blackhole drops it too) |
+| assistant text | 23,216 | 2.5% | ~93.5% kept, tail truncated |
+| user text | 179 | 0.02% | fully kept |
+| total | 915,313 | | output 21.9K (blackhole) / 24.2K (this port) |
 
-压缩比 ≈ **1:40**。97% 的"丢失"来自工具结果与 thinking,二者按设计不进入
-摘要;对话本体(user+assistant)基本原样保留(blackhole 93.5% / 本包 103.2%)。
+Ratio ≈ **1:40**. 97% of the "loss" is tool results and thinking, which by
+design never enter the brief; the conversation itself (user+assistant) is
+kept almost verbatim (blackhole 93.5% / this port 103.2%).
 
-## 2. 实体级保真(硬事实:路径/文件名/符号/URL)
+## 2. Entity-level fidelity (hard facts: paths/filenames/symbols/URLs)
 
-| 来源 | 实体数 | blackhole 保留 | 本包保留 |
+| Source | entities | blackhole kept | this port kept |
 |---|---|---|---|
-| user 文本 | 0 ¹ | n/a | n/a |
-| assistant 文本 | 90 | 36 (40%) | 37 (41%) |
-| 工具结果/参数 | 2,224 | 101 (5%) | 104 (5%) |
-| 工具错误文本 | 55 | 11 (20%) | 11 (20%) |
-| 错误首行(18 条真实错误) | 18 条 | **全部保留** | **全部保留** |
+| user text | 0 ¹ | n/a | n/a |
+| assistant text | 90 | 36 (40%) | 37 (41%) |
+| tool results/args | 2,224 | 101 (5%) | 104 (5%) |
+| tool error text | 55 | 11 (20%) | 11 (20%) |
+| error first lines (18 real errors) | 18 | **all kept** | **all kept** |
 
-¹ 该会话 user 消息为纯中文短句,不含路径类实体。
+¹ The audited session's user messages are short Chinese questions with no
+path-like entities.
 
-解读:
-- assistant 文本中 60% 实体丢失 → 集中在 **512-token 截断点之后**的文本尾部;
-- 工具结果 95% 实体丢失 → 但工具**参数**(路径/pattern)保留,实体可通过重跑工具恢复;
-- 错误首行全部保留(150 字符策略生效)。
+Reading:
+- ~60% of assistant-text entities are lost — concentrated in the text tail
+  beyond the 512-token cut;
+- 95% of tool-result entities are lost, but tool **arguments** (paths/
+  patterns) survive, so details are recoverable by re-running the tool;
+- every error first line is kept (the 150-char policy works).
 
-## 3. LLM A/B 问答评测(5 道事实题,deepseek-v4-flash-free)
+## 3. LLM A/B probe (5 factual questions, deepseek-v4-flash-free)
 
-A 组 = 完整消息窗口;B 组 = 本包压缩摘要(24.2K chars)。要求:只依据给定内容,
-摘要中没有就明说。
+Group A = the full message window containing the answer; Group B = the
+compaction brief of the whole session (24.2K chars). Instructions: answer
+only from the given content; say "not in the brief" when absent.
 
-| # | 事实来源 | 期望答案 | A(完整) | B(摘要) | 判定 |
+| # | fact source | expected | A (full) | B (brief) | verdict |
 |---|---|---|---|---|---|
-| 1 | assistant 文本 | v0.4.5 | v0.4.5 ✓ | v0.4.5 ✓ | 无损 |
-| 2 | 工具错误首行 | D:\tmp\...\index.js | ✓ 完全一致 | ✓ 完全一致 | 无损 |
-| 3 | thinking 内 ⚠ | textTokens=512 | 512 ✓(读自思考链) | "摘要中无此信息" | **丢 thinking,但拒答不幻觉** |
-| 4 | assistant 文本 | \<compacted-summary\> | ✓ | ✓ 完全一致 | 无损 |
-| 5 | 仅工具结果(目录列表) | 7 个文件名 | ✓ 7/7 | 推断出 3/7(index.js、compiler.js、region.js),并说明 ls 输出被截断 | **细节降级,方向/诚实性保持** |
+| 1 | assistant text | v0.4.5 | v0.4.5 ✓ | v0.4.5 ✓ | lossless |
+| 2 | tool error first line | D:\tmp\...\index.js | ✓ exact | ✓ exact | lossless |
+| 3 | inside thinking ⚠ | textTokens=512 | 512 ✓ (read from reasoning) | "not in the brief" | reasoning dropped; refused, no hallucination |
+| 4 | assistant text | \<compacted-summary\> | ✓ | ✓ exact | lossless |
+| 5 | tool result only (dir listing) | 7 filenames | ✓ 7/7 | inferred 3/7 (index.js, compiler.js, region.js from later args), notes the ls output was cut | details degrade; direction & honesty hold |
 
-结论:
-- **对话内的既有事实(assistant 文本、错误首行):压缩后回答准确性持平(3/3 无损)**;
-- **思考链信息**:压缩省略(设计行为),模型会拒答而非编造——不产生错误答案,只产生"不知道";
-- **工具结果细节**:精确细节降级(Q5 只能靠指针+后续工具参数推断 3/7),但模型**不会幻觉补全**,
-  且指针保留使细节可重查(bash/read 可重跑)。
+Conclusion:
+- **Established facts in the conversation (assistant text, error first
+  lines): answer accuracy is unchanged after compaction (3/3 lossless)**;
+- **Reasoning-sourced facts**: dropped by design; the model refuses instead
+  of fabricating — no wrong answers, only "unknown";
+- **Tool-result details**: precision degrades (Q5: 3/7 via pointers + later
+  args), but the model never hallucinates the rest, and the kept `(seq N)`
+  pointers + arguments make the details re-fetchable (tools can be re-run).
 
-## 4. 结论:准确性影响分三层
+## 4. Verdict: three layers of accuracy impact
 
-1. **不影响**(对话结论、错误诊断、已达成的工作):压缩几乎无损,模型回答能力持平。
-2. **可恢复降级**(工具细节):回答会"模糊化",但靠 `(seq N)` 指针 + 保留的参数,
-   模型可重新执行工具拿回真相;端到端任务推进不受影响。
-3. **结构性缺失**(思考链):模型只拒答,不产生错误事实;若业务要求思考复盘,
-   可打开 `includeReasoning`。
+1. **No impact** (conclusions, error diagnosis, completed work): compaction
+   is near-lossless; answer accuracy holds.
+2. **Recoverable degradation** (tool details): answers become vaguer, but
+   via `(seq N)` pointers and kept arguments the model can re-run the tool
+   and recover ground truth; end-to-end agentic progress is unaffected.
+3. **Structural omission** (reasoning): the model refuses, never asserts
+   false facts; enable `includeReasoning` if reasoning review is required.
 
-## 复现
+## Reproduce
 
 ```bash
-node tests/equivalence/entity-fidelity.mjs          # 实体级保真
+node tests/equivalence/entity-fidelity.mjs          # entity-level retention
 DSH_EVAL_KEY=... DSH_EVAL_BASE=... node tests/equivalence/eval-fidelity-llm.mjs [q1..q5]
-                               # LLM A/B(OpenAI-compatible endpoint via env;默认 deepseek-v4-flash-free)
+                               # LLM A/B (OpenAI-compatible endpoint via env;
+                               # default model deepseek-v4-flash-free)
 ```

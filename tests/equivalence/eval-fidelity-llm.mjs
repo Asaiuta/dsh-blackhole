@@ -82,37 +82,37 @@ const BRIEF = joinInstantEntries(compiled.entries)
 // ── questions ──
 const questions = [
   {
-    q: '本机安装的 pi-blackhole 插件的版本号是什么?只回答版本号。',
+    q: 'What is the version number of the pi-blackhole plugin installed on this machine? Answer with just the version.',
     answer: 'v0.4.5',
-    note: 'assistant 文本',
+    note: 'assistant text',
     loc: messages.findIndex((m) => m.role === 'assistant' && JSON.stringify(m.content).includes('pi-blackhole v0.4.5')),
     win: 6,
   },
   {
-    q: '会话中出现的第一个 ENOENT 错误试图访问的完整路径是什么?只回答路径。',
+    q: 'What is the full path the first ENOENT error in the session tried to access? Answer with just the path.',
     answer: 'D:\\tmp\\dsh-instant\\package\\src\\index.js',
-    note: '工具错误首行',
+    note: 'tool error first line',
     loc: messages.findIndex((m) => m.role === 'toolResult' && m.isError === true && JSON.stringify(m.content).includes('ENOENT')),
     win: 6,
   },
   {
-    q: '本仓库 instant 编译器的默认配置中 textTokens 的默认值是多少?只回答数字。',
+    q: "What is the default value of textTokens in the default instant compiler options of this repository? Answer with just the number.",
     answer: '512',
-    note: 'assistant 文本',
+    note: 'assistant text',
     loc: messages.findIndex((m) => m.role === 'assistant' && JSON.stringify(m.content).includes('textTokens')),
     win: 6,
   },
   {
-    q: "dsh-compaction-basic 的 frameSummary() 用哪一对标签包裹摘要内容?只回答标签名。",
+    q: "Which pair of tags does dsh-compaction-basic's frameSummary() wrap the summary content in? Answer with just the tag pair.",
     answer: '<compacted-summary>',
-    note: 'assistant 文本',
+    note: 'assistant text',
     loc: messages.findIndex((m) => m.role === 'assistant' && JSON.stringify(m.content).includes('<compacted-summary>')),
     win: 6,
   },
   {
-    q: 'dsh-compaction-instant 0.1.3 解压后的 package/src 目录下有哪些文件?按出现的顺序列出文件名,逗号分隔。',
+    q: 'Which files are in the package/src directory of the extracted dsh-compaction-instant 0.1.3? List the filenames in the order they appear, comma-separated.',
     answer: 'command.js, compiler.js, index.js, recall.js, region.js, search.js, tool.js',
-    note: '仅存在于工具结果(目录列表)',
+    note: 'tool result only (directory listing)',
     loc: messages.findIndex((m) => m.role === 'toolResult' && JSON.stringify(m.content).includes('dsh-compaction-instant-0.1.3.tgz')),
     win: 12,
   },
@@ -181,8 +181,8 @@ const call = async (system, context, question) => {
   }
 }
 
-const SYSTEM_A = '你是事实提取器。只根据提供的会话内容回答,不允许编造。答案要精确。'
-const SYSTEM_B = '你是事实提取器。内容是一份压缩摘要(compaction brief)。只根据摘要中确实存在的信息回答;如果摘要里没有,明确说"摘要中无此信息"。不允许编造或推测。'
+const SYSTEM_A = 'You are a fact extractor. Answer only from the provided conversation content. Do not fabricate. Be precise.'
+const SYSTEM_B = 'You are a fact extractor. The content is a compaction brief. Answer only from information actually present in the brief; if it is absent, say clearly \"not in the brief\". Do not fabricate or guess.'
 
 // ── run ──
 const runList = process.argv[2] ? process.argv[2].split(',').map(Number) : [1, 2, 3, 4, 5]
