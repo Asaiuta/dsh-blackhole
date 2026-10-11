@@ -49,8 +49,16 @@ import {
 import type { InstantCompileOptions, InstantStats, RawMessage } from './instant.ts'
 import { compileBlackholeSummary, previousCheckpointSummary } from './blackhole-summary.ts'
 import type { BlackholeMessage } from './blackhole-summary.ts'
-import { registerRecallTool } from './recall.ts'
-import type { RecallSession, RecallToolRegistry } from './recall.ts'
+import { registerRecallTool, adaptRecallSession } from './recall.ts'
+import type { RecallEvent, RecallSession, RecallToolRegistry } from './recall.ts'
+import { deriveSessionMessage, readSessionEvents } from './session-access.ts'
+import type { SessionEventSource } from './session-access.ts'
+import {
+  clearRuntimeModeOverride,
+  loadRuntimeModeOverride,
+  saveRuntimeModeOverride,
+} from './mode-command.ts'
+import type { BlackholeModeController } from './mode-command.ts'
 
 const FALLBACK_MODES = new Set(['instant', 'instant-then-llm', 'llm'])
 
@@ -68,20 +76,20 @@ export interface HybridCompiledSummary {
  * Build the id → durable seq map of a session by scanning its event log the
  * same way the official surface does (`deriveEventMessage`). Every stored
  * message answers by id, so the flattened shadowed region's messages resolve
- * to their real log positions.
+ * to their real log positions. Accepts both the runtime `Session`
+ * (`snapshotEvents()`) and test fakes (a plain `events` array).
  */
 export function resolveRegionSeqs(
-  session: {
-    events: readonly { seq: number }[]
-    deriveEventMessage(event: unknown): Message | null
-  },
+  session: SessionEventSource,
   messages: readonly Message[],
 ): number[] {
   const idToSeq = new Map<string, number>()
-  for (const event of session.events) {
+  for (const event of readSessionEvents(session)) {
     if (typeof event.seq !== 'number') continue
-    const message = session.deriveEventMessage(event)
-    if (message !== null && typeof message.id === 'string') idToSeq.set(message.id, event.seq)
+    const message = deriveSessionMessage(session, event) as Message | null
+    if (message !== null && message !== undefined && typeof message.id === 'string') {
+      idToSeq.set(message.id, event.seq)
+    }
   }
   return messages.map((message) => idToSeq.get(message.id) ?? -1)
 }
@@ -104,8 +112,16 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
   readonly state: RemoteCompactionStateStore | undefined
   /** The plugin's own validated config (base fields live in `this.config`). */
   protected readonly options: HybridCompactionConfig
-  /** Normalized fallback chain («instant» | «instant-then-llm» | «llm»). */
-  private readonly fallbackMode: 'instant' | 'instant-then-llm' | 'llm'
+  /** Effective fallback chain: config default with any persisted runtime override applied. */
+  private fallbackMode: 'instant' | 'instant-then-llm' | 'llm'
+  /** Config-resolved fallback chain (what `/blackhole-mode reset` restores). */
+  private readonly configFallbackMode: 'instant' | 'instant-then-llm' | 'llm'
+  /** Remote Responses gate; `/blackhole-mode remote off` closes it, persistently. */
+  private remoteEnabled = true
+  /** Directory the sticky `/blackhole-mode` override file lives in, if resolvable. */
+  private readonly modeStateDir: string | undefined
+  /** Public controller seam the `blackhole-commands` plugin reads via `ctx.compaction`. */
+  readonly modeController: BlackholeModeController
   /** Compiled local-compiler options. */
   private readonly compiler: InstantCompileOptions & { noisePatterns: RegExp[] }
   /** Persisted Codex-style installation id, resolved lazily. */
@@ -133,6 +149,10 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
     this.state = resolvedStateDir !== undefined
       ? new RemoteCompactionStateStore(resolvedStateDir)
       : undefined
+    // The sticky /blackhole-mode override file lives in the same plugin state
+    // tree as the remote replacement history, but resolves independently of
+    // persistRemoteHistory so runtime switching keeps working when that's off.
+    this.modeStateDir = stateDir?.trim() || defaultStateDir()
     if (this.state !== undefined) {
       // Adapter-facing bridge.  The DSH request seam is immutable, so a
       // Responses adapter can opt in by resolving this service and calling
@@ -154,6 +174,12 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
     this.fallbackMode = explicit !== undefined && explicit.length > 0
       ? (explicit as 'instant' | 'instant-then-llm' | 'llm')
       : (fallbackToLlm === false ? 'instant' : 'instant')
+    this.configFallbackMode = this.fallbackMode
+    // Re-apply the sticky runtime override (if any) over the config defaults;
+    // a corrupt or foreign file is ignored, config remains the durable truth.
+    const modeOverride = loadRuntimeModeOverride(this.modeStateDir)
+    if (modeOverride?.fallbackMode !== undefined) this.fallbackMode = modeOverride.fallbackMode
+    if (modeOverride?.remoteEnabled !== undefined) this.remoteEnabled = modeOverride.remoteEnabled
 
     const noiseList = noisePatterns !== undefined && noisePatterns.length > 0
       ? noisePatterns : DEFAULT_NOISE_PATTERNS
@@ -182,41 +208,86 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
     this.checkpointScale = checkpointScale ?? 0.1
     this.checkpointCap = checkpointCap ?? 65536
 
-    // dsh-tools is an optional host service.  Probe it through `get()` (a
-    // direct undeclared property read makes Cordis throw), and also observe
-    // `internal/service` so a full profile that loads dsh-tools later still
-    // receives recall.  The listener and the returned registry disposer are
-    // both owned by this plugin fiber.
-    let recallDisposer: (() => void) | undefined
-    const attachRecall = (candidate: unknown): void => {
-      const tools = candidate as RecallToolRegistry | undefined
-      if (tools?.register === undefined) {
-        recallDisposer?.()
-        recallDisposer = undefined
-        return
+    // dsh-tools and dsh-commands are optional host services. Probe them via
+    // `get()` (a direct undeclared property read makes Cordis throw), and also
+    // observe `internal/service` so late-loaded profiles receive both recall
+    // surfaces. Listeners and registry disposers belong to this plugin fiber.
+    const releaseRecallRegistration = (surface: string, disposer: (() => void) | undefined): void => {
+      if (disposer === undefined) return
+      try {
+        disposer()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`dsh-blackhole: failed to release ${surface} recall registration (${message})`)
       }
-      if (recallDisposer !== undefined) return
-      const disposer = registerRecallTool(tools, (exec): RecallSession | undefined => {
-        const candidate = exec as { agent?: { session?: RecallSession } } | undefined
-        const session = candidate?.agent?.session
-        return session?.events !== undefined && typeof session.deriveEventMessage === 'function'
-          ? session
-          : undefined
-      })
-      if (disposer !== undefined) recallDisposer = disposer
+    }
+    let recallToolRegistry: RecallToolRegistry | undefined
+    let recallToolDisposer: (() => void) | undefined
+    const attachRecallTool = (candidate: unknown): void => {
+      if (candidate === recallToolRegistry) return
+      releaseRecallRegistration('tool', recallToolDisposer)
+      recallToolDisposer = undefined
+      recallToolRegistry = undefined
+      if (typeof (candidate as { register?: unknown } | null)?.register !== 'function') return
+      const tools = candidate as RecallToolRegistry
+      try {
+        const disposer = registerRecallTool(tools, (exec): RecallSession | undefined => {
+          const candidate = exec as { agent?: { session?: unknown } } | undefined
+          return adaptRecallSession(candidate?.agent?.session)
+        })
+        recallToolRegistry = tools
+        recallToolDisposer = typeof disposer === 'function' ? disposer : undefined
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`dsh-blackhole: optional recall tool registration failed (${message})`)
+      }
+    }
+    // The /blackhole-mode controller: the only mutable seam over the engine's
+    // runtime-switchable state (fallback chain + remote gate). Every switch
+    // persists into the plugin state dir and is re-applied on the next DSH
+    // start; config files remain the durable source of defaults. Public on
+    // purpose: the `blackhole-commands` plugin reads it through
+    // `ctx.compaction.modeController` to wire the user-facing command.
+    this.modeController = {
+      getFallbackMode: () => this.fallbackMode,
+      getFallbackModeDefault: () => this.configFallbackMode,
+      setFallbackMode: (mode) => {
+        if (!FALLBACK_MODES.has(mode)) throw new Error(`invalid fallback mode: ${mode}`)
+        this.fallbackMode = mode
+        this.persistModeOverride()
+      },
+      isRemoteEnabled: () => this.remoteEnabled,
+      isRemoteEnabledDefault: () => true,
+      setRemoteEnabled: (enabled) => {
+        this.remoteEnabled = enabled
+        this.persistModeOverride()
+      },
+      resetRuntimeMode: () => {
+        clearRuntimeModeOverride(this.modeStateDir)
+        this.fallbackMode = this.configFallbackMode
+        this.remoteEnabled = true
+      },
+      describeEndpoints: () => this.describeEndpoints(),
     }
     const safeContext = ctx as unknown as {
       get?: (name: string, strict?: boolean) => unknown
       on?: (name: string, listener: (...args: unknown[]) => void, options?: { global?: boolean }) => unknown
     }
-    attachRecall(safeContext.get?.('tools'))
+    attachRecallTool(safeContext.get?.('tools'))
+    // Cordis service notifications carry an isolation filter. A global
+    // listener would also see sibling/agent-scoped registries and could bind
+    // the wrong tools service into this plugin. Command registration is NOT
+    // done here: the probe-and-observe approach cannot see the host plane
+    // from inside the preset's isolated compaction group — the dedicated
+    // `blackhole-commands` plugin (inject: commands + compaction) owns it.
     safeContext.on?.('internal/service', (name, value) => {
-      if (name === 'tools') attachRecall(value)
-    }, { global: true })
+      if (name === 'tools') attachRecallTool(value)
+    })
     ctx.effect(() => () => {
-      recallDisposer?.()
-      recallDisposer = undefined
-    }, 'dsh-blackhole recall')
+      releaseRecallRegistration('tool', recallToolDisposer)
+      recallToolDisposer = undefined
+      recallToolRegistry = undefined
+    }, 'dsh-blackhole recall tool')
   }
 
   /** Token floor for the compiled checkpoint (scaled by the shadowed size). */
@@ -236,6 +307,27 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
     return undefined
   }
 
+  /** One-line description of the configured remote endpoints (for /blackhole-mode). */
+  private describeEndpoints(): string {
+    if (this.endpoints.length === 0) return 'no endpoints configured'
+    return this.endpoints
+      .map((endpoint) => `${endpoint.provider}/${endpoint.model} → ${endpoint.label}`)
+      .join(', ')
+  }
+
+  /** Best-effort persist of the sticky /blackhole-mode override. */
+  private persistModeOverride(): void {
+    const saved = saveRuntimeModeOverride(this.modeStateDir, {
+      fallbackMode: this.fallbackMode,
+      remoteEnabled: this.remoteEnabled,
+    })
+    if (!saved) {
+      this.ctx.logger.warn(
+        'dsh-blackhole: runtime mode override could not be persisted; it resets on the next DSH start',
+      )
+    }
+  }
+
   protected async summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult> {
     const target = conversationTarget(agent)
 
@@ -244,9 +336,9 @@ export class RoutingCompactionEngine extends BasicCompactionEngine {
       await this.state?.remove(agent.id)
       return this.instantSummarize(input, agent)
     }
-    const endpoint = this.matchEndpoint(target)
-
-    // Remote path only for providers with a matching endpoint.
+    // Remote path only when the runtime gate is open and a configured
+    // endpoint serves this provider/model.
+    const endpoint = this.remoteEnabled ? this.matchEndpoint(target) : undefined
     if (endpoint !== undefined) {
       const apiKey = endpoint.apiKey ?? (process.env[endpoint.apiKeyEnv] ?? '')
       if (apiKey.length === 0) {

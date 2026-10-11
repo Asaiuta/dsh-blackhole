@@ -1,7 +1,9 @@
 node_modules/
 smoke-patch.yml
-*.tgz.diff-labs/
+*.tgz
+diff-labs/
+.pnpm-store/
+*.bak-*
 tests/equivalence/algal-bundle.mjs
-
 tests/equivalence/.eval-out.json
 tests/equivalence/blackhole-brief-bundle.mjs

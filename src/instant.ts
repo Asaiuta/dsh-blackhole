@@ -184,6 +184,88 @@ export function truncateTokens(
   return { text: out + note, truncated: true }
 }
 
+/** Share of the token budget reserved for the tail window in dual-window truncation. */
+const TEXT_TAIL_SHARE = 3 // one third
+
+/**
+ * Dual-window truncation for assistant TEXT blocks: an over-budget block
+ * keeps its head AND its tail, eliding the middle behind a seq-pointer
+ * marker (`...(elided from seq N)...`).  Coding-agent conclusions sit at the
+ * END of assistant messages, so head-only truncation systematically cut them
+ * off — the real-session profile measured 6/55 blocks over budget with
+ * ~6.5K tokenizer tokens of tails dropped.  Deterministic: the head window
+ * is `ceil(limit·⅔)` tokens, the tail window `floor(limit/3)`, both
+ * hard-capped at 4 chars/token like {@link truncateTokens}.  Tool one-liners
+ * and user text stay head-only (`truncateTokens`): a one-liner's identity is
+ * its head, and user text shows no measured tail loss.
+ */
+export function truncateTextTokens(
+  text: string,
+  limit: number,
+  ref?: string,
+): { text: string; truncated: boolean } {
+  const maxChars = Math.max(32, limit * 4)
+  const tokens = tokenize(text)
+  let count = 0
+  let cut = tokens.length
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token.trim().length === 0) continue
+    count += 1
+    if (count > limit) {
+      cut = index
+      break
+    }
+  }
+  if (cut >= tokens.length && text.length <= maxChars) {
+    return { text: text.replace(/\s+/g, ' ').trim(), truncated: false }
+  }
+  const tailBudget = Math.max(1, Math.floor(limit / TEXT_TAIL_SHARE))
+  const headBudget = Math.max(1, limit - tailBudget)
+  let headCut = tokens.length
+  let headCount = 0
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token.trim().length === 0) continue
+    headCount += 1
+    if (headCount > headBudget) {
+      headCut = index
+      break
+    }
+  }
+  let tailStart = tokens.length
+  let tailCount = 0
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index]
+    if (token.trim().length === 0) continue
+    tailCount += 1
+    if (tailCount >= tailBudget) {
+      tailStart = index
+      break
+    }
+  }
+  if (tailStart <= headCut) {
+    // Windows overlap (content dense enough that chars, not tokens, bind):
+    // fall back to the head-only path, which owns that case.
+    return truncateTokens(text, limit, ref)
+  }
+  const flatten = (value: string): string => value.replace(/\s+/g, ' ').trim()
+  let headText = completeCodePointAtEnd(tokens.slice(0, headCut).join('').slice(0, headBudget * 4))
+  let tailText = tokens.slice(tailStart).join('')
+  if (tailText.length > tailBudget * 4) {
+    // The density cap trims the tail window from its HEAD — the tail window's
+    // whole point is the block's final tokens, so they must survive.
+    let sliceFrom = tailText.length - tailBudget * 4
+    const code = tailText.charCodeAt(sliceFrom)
+    if (code >= 0xdc00 && code <= 0xdfff) sliceFrom += 1 // don't split a surrogate pair
+    tailText = tailText.slice(sliceFrom)
+  }
+  headText = flatten(headText)
+  tailText = flatten(tailText)
+  const marker = ref === undefined ? '...(elided)...' : `...(elided from ${ref})...`
+  return { text: `${headText}${marker}${tailText}`, truncated: true }
+}
+
 // ── tool-call one-liner (VCC `_tool_summary`) ──────────────────────────────
 
 /** VCC's `_TOOL_SUMMARY_FIELDS`, extended for the DSH tool catalog. */
@@ -336,6 +418,18 @@ function imageLabel(block: RawBlock): string {
   return mime === undefined || mime.length === 0 ? '[image]' : `[image: ${mime}]`
 }
 
+/** Best-effort label for a file block (rc.2 FileBlock; metadata is attachment-owned). */
+function fileLabel(block: RawBlock): string {
+  const attachment = block.attachment as Record<string, unknown> | undefined
+  if (attachment !== undefined && typeof attachment === 'object') {
+    for (const key of ['name', 'filename', 'path', 'mediaType'] as const) {
+      const value = attachment[key]
+      if (typeof value === 'string' && value.length > 0) return `[file: ${value}]`
+    }
+  }
+  return '[file]'
+}
+
 /** Project nested tool-result blocks into one plain-text string. */
 export function projectToolResultText(blocks: readonly RawBlock[]): string {
   const parts: string[] = []
@@ -358,9 +452,17 @@ export function projectToolResultText(blocks: readonly RawBlock[]): string {
   return parts.join('\n')
 }
 
-/** Whether a message source identifies a landed compaction checkpoint node. */
+/**
+ * Whether a message source identifies a landed compaction checkpoint node.
+ * The official vocabulary registers the `compact-checkpoint` source kind via
+ * module augmentation; the legacy free-form `kind: 'plugin'` +
+ * `plugin: 'compact'` shape stays as a fallback for sessions written by
+ * older harness revisions.
+ */
 export function isCheckpointSource(source: RawSource | undefined): boolean {
-  return source !== undefined && source.kind === 'plugin' && source.plugin === 'compact'
+  if (source === undefined) return false
+  if (source.kind === 'compact-checkpoint') return true
+  return source.kind === 'plugin' && source.plugin === 'compact'
 }
 
 function seqRef(seq: number): string {
@@ -445,7 +547,7 @@ export interface InstantCompileOptions {
   collapseSkills?: boolean
   /** Strip leading self-talk fillers from assistant text (hmm/wait/actually/…). Default true. */
   stripSelfTalk?: boolean
-  /** Merge adjacent identical tool one-liners (`… xN`). Default true. */
+  /** Merge repeated tool one-liners checkpoint-wide into their last occurrence (`… xN`, last-wins). Default true. */
   mergeToolLines?: boolean
   /** Max tool one-liners per assistant turn; 0 = unlimited. Default 8. */
   toolsPerTurn?: number
@@ -532,13 +634,96 @@ function estimateMessagesTokensImpl(messages: readonly RawMessage[]): number {
  *   - checkpoint nodes (source plugin `compact`) render as `[system]` text;
  *   - a noise-only user message leaves a `* [user message elided: noise-only]`
  *     note instead of silence;
- *   - long text truncates with `...(truncated from seq N)`.
+ *   - assistant text truncates dual-window (head + tail around an
+ *     `...(elided from seq N)...` mid marker); user text and tool one-liners
+ *     truncate head-only with `...(truncated from seq N)`.
  *
  * When the total exceeds `maxTokens`, the cap drops the oldest
  * `tool`/`media`/`note` rows first, then the oldest `text`/`reasoning`
  * rows, always keeping the newest content, and prepends an `[N entries
  * elided: seqs a-b]` note.
  */
+/**
+ * Merge repeated tool one-liners (same rendered base) into the LAST
+ * occurrence, across the WHOLE checkpoint: `... (seq A, seq B -> result R)
+ * xN`.  Upstream pi-blackhole merges adjacent rows only, but real sessions
+ * repeat a base across user turns and section breaks (26 of 33 repeated rows
+ * on the profiled real session), so adjacency catches almost nothing there.
+ * Last-wins: a re-read of the same file supersedes earlier reads, so the
+ * surviving row sits at the recency position the rest of the compiler
+ * privileges.  All member call seqs are kept.  Result pointers survive for
+ * the LAST member and for any member whose result failed (`[tool_error]`
+ * rows are the checkpoint's error signal — de-pointering a failure would
+ * hide why the work continued); earlier successful results remain one recall
+ * away via their call seqs.
+ *
+ * Role headers are repaired mechanically: a dropped member may carry a
+ * segment's leading `[role]` header, which then belongs to the next
+ * surviving entry of that same segment (the walk below attaches it to the
+ * first header-less survivor before the next header appears).
+ *
+ * Mutates `entries` in place; returns whether anything was dropped.
+ */
+function mergeRepeatedToolRows(
+  entries: InstantEntry[],
+  stats: InstantStats,
+  errorResultSeqs: ReadonlySet<number>,
+): boolean {
+  const TOOL_ROW_RE = /^(\[user\]\n|\[assistant\]\n|\[system\]\n)?(\* .*?) \((seq [^)]*)\)$/
+  const HEADER_RE = /^(\[user\]\n|\[assistant\]\n|\[system\]\n)/
+  const groups = new Map<string, number[]>()
+  entries.forEach((entry, index) => {
+    if (entry.kind !== 'tool') return
+    const m = entry.text.match(TOOL_ROW_RE)
+    if (m === null) return
+    const members = groups.get(m[2])
+    if (members === undefined) groups.set(m[2], [index])
+    else members.push(index)
+  })
+  const dropped = new Set<number>()
+  const replacements = new Map<number, InstantEntry>()
+  for (const [base, indexes] of groups) {
+    if (indexes.length < 2) continue
+    const members = indexes.map((index) => ({ index, entry: entries[index] }))
+    const last = members[members.length - 1]
+    const refs = members.map(({ entry }) => {
+      const ref = entry.text.match(TOOL_ROW_RE)?.[3] ?? ''
+      const resultSeq = Number(ref.match(/-> result (\d+)/)?.[1] ?? Number.NaN)
+      if (entry === last.entry || (Number.isInteger(resultSeq) && errorResultSeqs.has(resultSeq))) return ref
+      return ref.split(' -> ')[0]
+    })
+    replacements.set(last.index, {
+      seq: last.entry.seq,
+      text: `${base} (${refs.join(', ')}) x${members.length}`,
+      kind: 'tool',
+    })
+    for (const { index } of members) {
+      if (index !== last.index) dropped.add(index)
+    }
+  }
+  if (dropped.size === 0) return false
+  const out: InstantEntry[] = []
+  let pendingHeader = ''
+  entries.forEach((entry, index) => {
+    if (dropped.has(index)) {
+      const m = entry.text.match(HEADER_RE)
+      if (m !== null) pendingHeader = m[1] // the emptied segment keeps its label
+      return
+    }
+    let final = replacements.get(index) ?? entry
+    if (pendingHeader !== '') {
+      if (final.text.match(HEADER_RE) === null) final = { ...final, text: pendingHeader + final.text }
+      pendingHeader = '' // attached, or a new segment started and needs no carry
+    }
+    out.push(final)
+  })
+  entries.length = 0
+  entries.push(...out)
+  stats.elidedToolRows += dropped.size
+  stats.elidedRows += dropped.size
+  return true
+}
+
 export function compileInstantRegion(
   nodes: readonly CompilerNode[],
   options: InstantCompileOptions,
@@ -578,9 +763,20 @@ export function compileInstantRegion(
   // the tool name through their correlated call.
   const resultSeqByCallId = new Map<string, number>()
   const callNameByCallId = new Map<string, string>()
+  const errorResultSeqs = new Set<number>()
   for (const node of nodes) {
     const message = node.message
     if (message === null || message === undefined || message.content === undefined) continue
+    // DSH 0.2.0-rc promotes tool results to first-class tool-role messages
+    // (toolCallId + isError live on the message); register the pointer here so
+    // earlier assistant one-liners can reference `-> result N`.
+    if (message.role === 'tool') {
+      const toolMessage = message as RawMessage & { toolCallId?: unknown; isError?: unknown }
+      const toolCallId = typeof toolMessage.toolCallId === 'string' ? toolMessage.toolCallId : undefined
+      if (toolCallId !== undefined) resultSeqByCallId.set(toolCallId, node.seq)
+      if (toolMessage.isError === true) errorResultSeqs.add(node.seq)
+      continue
+    }
     for (const block of message.content) {
       if (block.type === 'tool-call' && typeof block.id === 'string') {
         if (typeof block.name === 'string' && block.name.length > 0) {
@@ -588,6 +784,7 @@ export function compileInstantRegion(
         }
       } else if (block.type === 'tool-result' && typeof block.toolCallId === 'string') {
         resultSeqByCallId.set(block.toolCallId, node.seq)
+        if (block.isError === true) errorResultSeqs.add(node.seq)
       }
     }
   }
@@ -623,7 +820,9 @@ export function compileInstantRegion(
           header = roleHeader('assistant')
           // pi-blackhole strips leading self-talk filler (hmm/wait/actually/…).
           const cleaned = options.stripSelfTalk === false ? text : stripSelfTalkPrefix(text)
-          const kept = truncateTokens(cleaned, effective.textTokens, seqRef(node.seq))
+          // Dual-window truncation keeps the block's tail — coding-agent
+          // conclusions live at the END of assistant messages.
+          const kept = truncateTextTokens(cleaned, effective.textTokens, seqRef(node.seq))
           pushEntry(node.seq, header + kept.text, 'text')
           continue
         }
@@ -635,7 +834,7 @@ export function compileInstantRegion(
           const text = sanitize(block.text ?? '')
           if (text.trim().length === 0) continue
           header = roleHeader('assistant')
-          const kept = truncateTokens(text, effective.textTokens, seqRef(node.seq))
+          const kept = truncateTextTokens(text, effective.textTokens, seqRef(node.seq))
           pushEntry(node.seq, header + kept.text, 'reasoning')
           continue
         }
@@ -689,6 +888,12 @@ export function compileInstantRegion(
           stats.documents += 1
           header = roleHeader('assistant')
           pushEntry(node.seq, header + `[document] (${seqRef(node.seq)})`, 'media')
+          continue
+        }
+        if (block.type === 'file') {
+          stats.documents += 1
+          header = roleHeader('assistant')
+          pushEntry(node.seq, header + `${fileLabel(block)} (${seqRef(node.seq)})`, 'media')
           continue
         }
         // Unknown merge-extensible block types render as labels.
@@ -769,6 +974,11 @@ export function compileInstantRegion(
           surviving += 1
           header = roleHeader('user')
           pushEntry(node.seq, header + `[document] (${seqRef(node.seq)})`, 'media')
+        } else if (block.type === 'file') {
+          stats.documents += 1
+          surviving += 1
+          header = roleHeader('user')
+          pushEntry(node.seq, header + `${fileLabel(block)} (${seqRef(node.seq)})`, 'media')
         } else {
           const text = sanitize(block.text ?? '')
           if (text.length === 0) continue
@@ -787,16 +997,45 @@ export function compileInstantRegion(
         )
       }
     }
+    if (message.role === 'tool') {
+      // DSH 0.2.0-rc shape: a first-class tool-result message. Successful
+      // results never occupy an entry (the one-liner's `-> result N` pointer
+      // plus recall covers them); failures keep their first line, exactly
+      // like the legacy leading `tool-result` block on the user branch.
+      const toolMessage = message as RawMessage & { toolCallId?: unknown; isError?: unknown }
+      stats.toolResults += 1
+      const errorChars = options.toolErrorChars ?? 150
+      if (errorChars > 0 && toolMessage.isError === true) {
+        const body = firstLineOf(projectToolResultText(message.content ?? []), errorChars)
+        if (body.length > 0 && body !== '(no output)') {
+          const toolName = typeof toolMessage.toolCallId === 'string'
+            ? (callNameByCallId.get(toolMessage.toolCallId) ?? 'tool')
+            : 'tool'
+          stats.toolErrors += 1
+          pushEntry(
+            node.seq,
+            `[tool_error] ${toolName} (${seqRef(node.seq)})\n${body}`,
+            'tool-error',
+          )
+          // A tool-error row interrupts the role stream: the next entry
+          // re-opens its own segment header (pi-blackhole treats every
+          // `[tool_error]` section as a fresh block).
+          open = false
+          lastRole = undefined
+        }
+      }
+    }
   }
 
-  // ── post-processing: per-turn tool cap + identical tool-line merge ──────
-  // pi-blackhole keeps at most `toolsPerTurn` tool one-liners per assistant
-  // turn (tail wins) and merges adjacent identical one-liners; both reduce
-  // checkpoint rows before the global token cap runs.
+  // ── post-processing: repeated-tool merge → per-message tool cap ─────────
+  // Order matters: dedup is not selection — repeated rows collapse FIRST
+  // (last-wins, cross-segment), then the per-message cap counts DISTINCT
+  // rows, then the global token cap below drops the oldest.
   if (entries.length > 0) {
     const toolsPerTurn = options.toolsPerTurn ?? 8
     const merge = options.mergeToolLines !== false
-    if (toolsPerTurn > 0 || merge) {
+    const merged = merge ? mergeRepeatedToolRows(entries, stats, errorResultSeqs) : false
+    if (merged || toolsPerTurn > 0) {
       // Split into role segments: an entry carrying a `[role]` header starts
       // a new segment.
       const segments: Array<{ role: string; items: InstantEntry[] }> = []
@@ -814,92 +1053,66 @@ export function compileInstantRegion(
       if (items.length > 0) segments.push({ role: curRole, items })
 
       const processed: InstantEntry[] = []
-      const TOOL_ROW_RE = /^(\[user\]\n|\[assistant\]\n|\[system\]\n)?(\* .*?) \((seq [^)]*)\)$/
-      const MERGED_ROW_RE = /^(\[user\]\n|\[assistant\]\n|\[system\]\n)?(\* .*?) \((.+)\) x(\d+)$/
       for (const segment of segments) {
         // Per-turn tool cap (tool one-liners only; `$ cmd` bash lines and
-        // tool-error rows do not count, mirroring pi-blackhole).
+        // tool-error rows do not count).  Upstream pi-blackhole applies this
+        // per `[assistant]` SECTION, but tool results produce no section
+        // break, so a real agentic chain (one user turn, then dozens of
+        // calls) is one section and the section cap chops most of the chain:
+        // on the profiled real session that is 37/152 rows (24%), whose
+        // results all become pointer-invisible, while no single assistant
+        // message there exceeds 4 calls.  Deviate deliberately (data-backed):
+        // a turn is a run of entries sharing one source seq — one assistant
+        // message — and the omission note carries that seq so the dropped
+        // calls stay `#N`-navigable.
         if (segment.role === 'assistant' && toolsPerTurn > 0) {
-          const toolIdxs: number[] = []
-          segment.items.forEach((entry, index) => {
-            if (entry.kind === 'tool' && /(^|\n)\* /.test(entry.text)) toolIdxs.push(index)
-          })
-          if (toolIdxs.length > toolsPerTurn) {
-            const dropCount = toolIdxs.length - toolsPerTurn
-            const dropSet = new Set(toolIdxs.slice(0, dropCount))
-            const firstKept = toolIdxs[dropCount]
-            const firstDropped = toolIdxs[0]
-            // The dropped head may carry the segment's `[assistant]` header;
-            // keep it on the omission note so the segment stays labeled.
-            const droppedHeader = segment.items[firstDropped]?.text.match(/^(\[user\]\n|\[assistant\]\n|\[system\]\n)/)?.[1] ?? ''
-            const next: InstantEntry[] = []
-            let inserted = false
-            for (let index = 0; index < segment.items.length; index++) {
-              if (dropSet.has(index)) continue
-              if (!inserted && index === firstKept) {
-                next.push({
-                  seq: segment.items[firstDropped]?.seq ?? -1,
-                  text: `${droppedHeader}* (${dropCount} earlier tool-call entries omitted)`,
-                  kind: 'note',
-                })
-                inserted = true
+          const next: InstantEntry[] = []
+          let runStart = 0
+          while (runStart < segment.items.length) {
+            const turnSeq = segment.items[runStart].seq
+            let runEnd = runStart
+            while (runEnd < segment.items.length && segment.items[runEnd].seq === turnSeq) runEnd += 1
+            const turn = segment.items.slice(runStart, runEnd)
+            const toolIdxs: number[] = []
+            turn.forEach((entry, itemIndex) => {
+              if (entry.kind === 'tool' && /(^|\n)\* /.test(entry.text)) toolIdxs.push(itemIndex)
+            })
+            if (toolIdxs.length > toolsPerTurn) {
+              const dropCount = toolIdxs.length - toolsPerTurn
+              const dropSet = new Set(toolIdxs.slice(0, dropCount))
+              const firstKept = toolIdxs[dropCount]
+              const firstDropped = toolIdxs[0]
+              // The dropped head may carry the segment's `[assistant]` header;
+              // keep it on the omission note so the segment stays labeled.
+              const droppedHeader = turn[firstDropped]?.text.match(/^(\[user\]\n|\[assistant\]\n|\[system\]\n)/)?.[1] ?? ''
+              let inserted = false
+              for (let itemIndex = 0; itemIndex < turn.length; itemIndex++) {
+                if (dropSet.has(itemIndex)) continue
+                if (!inserted && itemIndex === firstKept) {
+                  next.push({
+                    seq: turnSeq,
+                    text: `${droppedHeader}* (${dropCount} earlier tool-call entries omitted: seq ${turnSeq})`,
+                    kind: 'note',
+                  })
+                  inserted = true
+                }
+                next.push(turn[itemIndex])
               }
-              next.push(segment.items[index])
-            }
-            segment.items = next
-            stats.elidedToolRows += dropCount
-            stats.elidedRows += dropCount
-          }
-        }
-        // Merge adjacent identical tool one-liners into `... (seq A, seq B) xN`.
-        if (merge) {
-          const merged: InstantEntry[] = []
-          for (const entry of segment.items) {
-            if (entry.kind !== 'tool') {
-              merged.push(entry)
-              continue
-            }
-            const m = entry.text.match(TOOL_ROW_RE)
-            if (m === null) {
-              merged.push(entry)
-              continue
-            }
-            const base = m[2]
-            const ref = m[3]
-            const last = merged[merged.length - 1]
-            const acc = last !== undefined && last.kind === 'tool'
-              ? last.text.match(MERGED_ROW_RE)
-              : null
-            const lastRow = last !== undefined && last.kind === 'tool'
-              ? last.text.match(TOOL_ROW_RE)
-              : null
-            if (acc !== null && acc[2] === base) {
-              const plainRef = ref.split(' -> ')[0]
-              merged[merged.length - 1] = {
-                seq: last.seq,
-                text: `${acc[1] ?? ''}${base} (${acc[3]}, ${plainRef}) x${parseInt(acc[4], 10) + 1}`,
-                kind: 'tool',
-              }
-            } else if (lastRow !== null && lastRow[2] === base) {
-              // First merge: two plain identical rows become `... (r1, r2) x2`.
-              const plainRef = ref.split(' -> ')[0]
-              const lastRef = lastRow[3].split(' -> ')[0]
-              merged[merged.length - 1] = {
-                seq: last.seq,
-                text: `${lastRow[1] ?? ''}${base} (${lastRef}, ${plainRef}) x2`,
-                kind: 'tool',
-              }
+              stats.elidedToolRows += dropCount
+              stats.elidedRows += dropCount
             } else {
-              merged.push(entry)
+              next.push(...turn)
             }
+            runStart = runEnd
           }
-          segment.items = merged
+          segment.items = next
         }
         processed.push(...segment.items)
       }
       entries.length = 0
       entries.push(...processed)
-      // Recompute estimates so the cap below operates on the merged rows.
+      // Recompute estimates so the global token cap below operates on the
+      // merged and capped rows.
       estimated.clear()
       let total = 0
       for (const entry of entries) {

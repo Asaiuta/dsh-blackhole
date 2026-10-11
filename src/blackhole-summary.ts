@@ -165,10 +165,29 @@ export function normalizeBlackholeMessages(
   const normalized: NormalizedBlackholeBlock[] = []
   messages.forEach((message, messageIndex) => {
     // A prior DSH compaction checkpoint is the durable previous-summary input,
-    // not fresh transcript content.  It is merged explicitly by
-    // `previousCheckpointSummary()` below.
-    if (message.source?.kind === 'plugin' && message.source.plugin === 'compact') return
+    // not fresh transcript content. It is merged explicitly by
+    // `previousCheckpointSummary()` below. rc.2 registers the
+    // `compact-checkpoint` source kind; the legacy free-form marker stays.
+    const source = message.source
+    if (source?.kind === 'compact-checkpoint') return
+    if (source?.kind === 'plugin' && source?.plugin === 'compact') return
     const seq = seqs[messageIndex] ?? -1
+    // rc.2 promotes tool results to first-class tool-role messages; the
+    // legacy shape carries them as a leading `tool-result` user block below.
+    if (message.role === 'tool') {
+      const toolMessage = message as BlackholeMessage & { toolCallId?: unknown; isError?: unknown }
+      const toolCallId = typeof toolMessage.toolCallId === 'string' ? toolMessage.toolCallId : undefined
+      normalized.push({
+        kind: 'tool-result',
+        text: flattenText(message.content),
+        seq,
+        messageIndex,
+        name: toolCallId === undefined ? undefined : toolNames.get(toolCallId),
+        toolCallId,
+        ...(toolMessage.isError === true ? { isError: true } : {}),
+      })
+      return
+    }
     const role = message.role === 'assistant' ? 'assistant' : 'user'
     for (const block of message.content ?? []) {
       switch (block.type) {
@@ -208,6 +227,7 @@ export function normalizeBlackholeMessages(
         }
         case 'image':
         case 'document':
+        case 'file':
           normalized.push({ kind: role, text: `[${block.type}]`, seq, messageIndex })
           break
         default:
@@ -446,7 +466,16 @@ export function compileBlackholeSummary(input: BlackholeSummaryInput): string {
 /** Pull the latest previous compact checkpoint text from a DSH message list. */
 export function previousCheckpointSummary(messages: readonly BlackholeMessage[]): string | undefined {
   for (const message of [...messages].reverse()) {
-    if (message.source?.kind !== 'plugin' || message.source.plugin !== 'compact') continue
+    // rc.2 registers the `compact-checkpoint` source kind; the legacy
+    // free-form `kind: 'plugin'` + `plugin: 'compact'` marker stays as a
+    // fallback for sessions written by older harness revisions.
+    const source = message.source
+    if (source?.kind === 'compact-checkpoint') {
+      const text = flattenText(message.content)
+      if (text.trim()) return text
+      continue
+    }
+    if (source?.kind !== 'plugin' || source?.plugin !== 'compact') continue
     const text = flattenText(message.content)
     if (text.trim()) return text
   }

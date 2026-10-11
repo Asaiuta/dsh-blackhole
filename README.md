@@ -71,6 +71,70 @@ The engine subclasses the official `BasicCompactionEngine`, so all pressure /
 retention / policy knobs, the token-meter pricing, and the context-overflow
 recovery behave exactly as upstream.
 
+## Recall and file recovery
+
+The plugin includes a pi-blackhole-style `recall` surface. It is registered
+automatically when the optional `dsh-tools` service is present, and an optional
+`/blackhole-recall` human command is registered when `dsh-commands` is present.
+Neither package is a hard dependency. Both surfaces read DSH's lossless
+in-memory event log and the original tool-call arguments, so they continue to
+work after a local or remote compaction checkpoint without depending on pi's
+JSONL files.
+
+Typical tool input:
+
+```json
+{
+  "query": "SecretNeedle",
+  "mode": "hybrid",
+  "scope": "lineage",
+  "page": 1,
+  "limit": 5
+}
+```
+
+The same search is available interactively as:
+
+```text
+/blackhole-recall SecretNeedle mode:hybrid scope:lineage page:1 limit:5
+```
+
+Supported recall forms are:
+
+| Form | Result |
+|---|---|
+| text (`parser`) or regex (`/parser/i`, `hook|inject`) | ranked transcript search; hybrid mode also searches bounded Write/Edit content |
+| `#N` | expand exactly durable event `N`, with complete prose/tool results up to the 50 KB response cap; file bodies remain referenced by path |
+| `#N:path` or `#N:file` | preview one file operation, or auto-select it when the entry has one file |
+| `#N:path:full` | return the complete operation body up to the 50 KB display cap |
+| `#N:path:offset` / `#N:path:offset:limit` | zero-based line paging (`limit` defaults to 30) |
+| `mode:file` | search only entries with content-bearing file operations |
+| `mode:touched` | list paths from content-bearing Write/Edit-style operations and their durable sequence numbers (5 paths per page by default) |
+| `scope:all` | include events outside the active lineage (the default is the active lineage) |
+| `expand: [N, ...]` | force up to 50 specific entries into a result page even when the query does not match |
+
+Write/Edit extraction recognizes `content`, `edits`, `oldText`, and `newText`
+along with common path keys. Ordinary ranked pages clip prose blocks to about
+300 characters and tool results to about 200 characters. `#N` restores the
+complete prose/result blocks, while file arguments remain summarized and file
+bodies are available only through `#N:path`. Search indexing clips each file
+operation to 10 KB; every recall response, including exact expansion and
+offset paging, is capped at 50 KB. Search/touched `limit` values are capped at
+100 entries and explicit expansion at 50 entries. Unsafe, oversized, or
+backtracking-prone regular expressions fall back to ordinary token search.
+Ambiguous paths are reported with candidate paths instead of being silently
+selected. A 12-character lowercase hexadecimal query is reserved for
+observational-memory IDs and returns an explicit integration message.
+
+This is intentionally close to pi-blackhole's transcript/file recall, but it
+is not OM-complete yet: the OM observation/reflection ledger, OM-ID lookup, and
+automatic reverse recall from OM records are a TODO. VCC-style summary output
+and recall are therefore coupled through durable DSH sequence numbers, not
+through OM memory IDs. `scope:all` always stays within the current DSH session
+and never loads sibling fork/session logs. Stock DSH sessions do not currently
+expose the optional `lineageSeqs` projection, so `lineage` and `all` differ only
+when a host supplies that projection.
+
 ## Install
 
 Requires DSH `0.1.0-rc.6` (web or headless profile).
@@ -159,6 +223,41 @@ The legacy `fallbackToLlm` boolean still maps: `false` forces `instant`;
 `true` behaves like the default. Targets with **no matching endpoint** always
 take the local compiler (or, in `llm` mode, the native LLM).
 
+### Runtime switching: `/blackhole-mode`
+
+The bundle patch mounts two dedicated plugin units inside the preset
+compaction group, mirroring the official shapes (`dsh-command-compact` /
+`dsh-tool-todo`):
+
+- `dsh-blackhole/commands` — `inject = ['commands', 'compaction']` — registers
+  `/blackhole-mode` and `/blackhole-recall`;
+- `dsh-blackhole/tools` — `inject = ['tools']` — registers the `recall` tool
+  through the official `defineTool()` wrapper (enforced JSON-Schema
+  arguments, structured output render).
+
+They appear wherever `/compact` and the built-in tools do — no config edit,
+no restart to take effect:
+
+```
+/blackhole-mode                 # status: current chain, remote gate, endpoints
+/blackhole-mode instant         # switch the fallback chain (instant | instant-then-llm | llm)
+/blackhole-mode llm             # e.g. hand this session's checkpoints to the LLM summarizer
+/blackhole-mode remote off      # close the remote gate; every target uses the local chain
+/blackhole-mode remote on       # reopen it
+/blackhole-mode reset           # drop all runtime overrides, back to config defaults
+```
+
+Switches are **sticky**: each one persists into `runtime-mode.json` inside the
+plugin state dir (default `$DSH_HOME/plugins/dsh-blackhole/state`) and is
+re-applied over the config defaults on every DSH start — so an override made
+yesterday survives today's restart. The plugin config (`fallbackMode` /
+`endpoints`) remains the durable source of defaults; the override file only
+carries runtime deltas, and the plugin never writes the host's profile YAML.
+`/blackhole-mode reset` (or deleting the file) returns everything to the
+config defaults. Disabling remote — or any local/LLM checkpoint landing —
+removes the session's persisted remote replacement history, keeping the
+"local checkpoint supersedes the remote window" invariant intact.
+
 ## Behavior notes
 
 - **Images**: DSH stores image bytes in the attachment store, which a remote
@@ -238,6 +337,7 @@ pnpm run build       # esbuild → lib/index.js
 node tests/smoke-load.mjs      # loader composition mounts the engine
 node tests/protocol-smoke.mjs  # conversion/SSE/round-trip vs a local fake endpoint
 node tests/hybrid-smoke.mjs    # compiler unit + routing (remote/instant/llm/compat)
+node tests/recall.mjs          # transcript/file recall + optional command/tool seams
 node tests/equivalence/build-algal.mjs && node tests/equivalence/differential.mjs
                                # protocol equivalence vs the REAL upstream bundle
 node tests/equivalence/build-blackhole.mjs && node tests/equivalence/differential-brief.mjs
@@ -245,6 +345,20 @@ node tests/equivalence/build-blackhole.mjs && node tests/equivalence/differentia
                                # brief compiler (BRIEF-DIFF.md: 11/12 vectors aligned)
 node tests/instant-blackhole-align.mjs
                                # regression suite pinning the aligned brief rules
+node tests/eval-quality.mjs    # checkpoint-QUALITY baseline: compression ratio,
+                               # entity survival (verbatim vs #N-pointed), pointer
+                               # integrity, determinism — floor thresholds fail on
+                               # regression.  Fixtures: two synthetic sessions
+                               # (tests/eval-fixtures.mjs) + the REAL recorded pi
+                               # transcript (DSH_EVAL_SESSION pins one; skips if none)
+node tests/eval-profile.mjs    # real-session composition profile: where shadow &
+                               # checkpoint tokens sit, truncation/elision losses,
+                               # tool-call redundancy, pointer visibility — the
+                               # evidence base for selection-work priorities
+node tests/eval-compare.mjs    # same real session through the VENDORED upstream
+                               # pi-blackhole brief compiler AND this package's
+                               # instant compiler, one yardstick: size, entity
+                               # recall by class, refs, loss-channel counters
 node tests/equivalence/differential-real-session.mjs
                                # content differential on a REAL recorded pi session
                                # (live transcript, not synthetic vectors)

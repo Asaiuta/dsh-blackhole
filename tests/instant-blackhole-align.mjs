@@ -106,14 +106,47 @@ assert.equal(stripSelfTalkPrefix('Hmm, actually, we should test.'), 'we should t
 }
 
 // ── 7. per-turn tool cap keeps tail, note marks omission ──────────────────
+// Deliberate deviation from upstream, data-backed: upstream caps per
+// [assistant] section, but tool results never break a section, so a real
+// agentic chain is one section and the cap chops most of it (37/152 rows on
+// the profiled real session) with results pointer-invisible.  Here a turn is
+// ONE assistant message (a run of entries sharing one seq) and the omission
+// note carries that seq so the dropped calls stay #N-navigable.
 {
   const calls = Array.from({ length: 10 }, (_, i) => toolCall(`t${i}`, 'Read', { file_path: `/f${i}.ts` }))
   const out = compile([assistant(calls)])
-  assert.match(out, /\[assistant\]\n\* \(2 earlier tool-call entries omitted\)/)
+  assert.match(out, /\[assistant\]\n\* \(2 earlier tool-call entries omitted: seq \d+\)/)
   assert.match(out, /\/f2\.ts/)
   assert.match(out, /\/f9\.ts/)
   assert.ok(!out.includes('f0.ts') && !out.includes('f1.ts'))
-  console.log('OK: per-turn tool cap keeps tail 8 + omission note')
+  console.log('OK: per-turn tool cap keeps tail 8 + omission note with seq pointer')
+}
+{
+  // Real agentic shape: many calls across consecutive assistant messages.
+  // Upstream (per-section) would drop 2 rows here; per-message keeps them all.
+  const messages = []
+  for (let i = 0; i < 10; i++) messages.push(assistant([toolCall(`t${i}`, 'Read', { file_path: `/f${i}.ts` })]))
+  const out = compile(messages)
+  assert.ok(!out.includes('omitted'), 'calls spread across messages must not trip the per-message cap')
+  assert.equal((out.match(/\* Read /g) ?? []).length, 10)
+  console.log('OK: per-message cap does not fire on a cross-message call chain')
+}
+{
+  // Cross-segment last-wins merge (deliberate deviation #3): the same base
+  // across user turns collapses to the LAST occurrence; every member call seq
+  // rides along in the refs, and the last member keeps its `-> result`
+  // pointer.  Upstream merges adjacent rows only.
+  const out = compile([
+    assistant([toolCall('a1', 'Read', { file_path: '/same.ts' })]),
+    toolResult('a1', 'stale contents'),
+    user('go on'),
+    assistant([toolCall('b1', 'Read', { file_path: '/same.ts' })]),
+    toolResult('b1', 'fresh contents'),
+  ])
+  assert.equal((out.match(/\* Read /g) ?? []).length, 1)
+  assert.match(out, /\* Read "\/same\.ts" \(seq \d+, seq \d+ -> result \d+\) x2/)
+  assert.ok(out.includes('go on'))
+  console.log('OK: cross-segment repeats merge last-wins with combined refs')
 }
 
 // ── 8. image mime kept in label ───────────────────────────────────────────

@@ -9,10 +9,10 @@ pi-blackhole compiler (`normalize` + `compileBrief`) and to this package's
 both checkpoints side by side. This is a **content-level** differential —
 protocol shape equivalence is covered separately by `differential.mjs`.
 
-## Status: aligned (2026-08-15, vectors V1–V12)
+## Status: aligned (2026-08-15, vectors V1–V12; V8 deliberately diverged 2026-10-11)
 
-11 of 12 vectors now produce equivalent non-whitespace output. The remaining
-divergence is a deliberate design choice (see below).
+10 of 12 vectors now produce equivalent non-whitespace output. The remaining
+divergences are deliberate design choices (see below).
 
 ### Aligned behaviors ✅
 | Vector | Behavior |
@@ -24,7 +24,6 @@ divergence is a deliberate design choice (see below).
 | V5 | failed tool results kept as `[tool_error] name (#N/seq N)` + first line (150 chars) |
 | V6 | `thinking` blocks elided by both |
 | V7 | identical tool one-liners merged: `* Grep "surrogate" (seq 0, seq 0, seq 0) x3` |
-| V8 | per-turn tool cap (8), tail wins, `* (N earlier tool-call entries omitted)` note |
 | V10 | image label keeps mime type: `[image: image/png]` |
 | V11 | `<skill name="X">…</skill>` → `[skill: X]` |
 | V12 | mixed session: full row-for-row equivalence including the `[tool_error]` segment interrupt |
@@ -32,7 +31,10 @@ divergence is a deliberate design choice (see below).
 ### Remaining divergence (intentional)
 | Vector | pi-blackhole | dsh instant | Rationale |
 |---|---|---|---|
+| V8 | per-SECTION tool cap (8): tool results never break a section, so one agentic chain is one section and the cap chops most of it, `* (N earlier tool-call entries omitted)` without a pointer | per-MESSAGE cap (8): a turn is one assistant message (entries sharing one seq); the note carries `: seq N` | Real-session profile (285 messages): the section cap dropped 37/152 call rows (24%), all pointer-invisible, while no single assistant message exceeded 4 calls. Per-message keeps the chain visible at ~15% more checkpoint tokens and the note keeps dropped calls `#N`-navigable |
 | V9 | empty user message dropped silently | `* [user message elided: noise-only] (seq N)` note | explicit elision marker keeps the loss visible and recallable; also `(...truncated from seq N)` keeps the truncation point instead of blackhole's bare `...(truncated)` |
+| — (no upstream vector) | assistant text truncates head-only, `...(truncated)` | assistant text truncates DUAL-WINDOW: head ⅔ + tail ⅓ of the block budget around an `...(elided from seq N)...` mid marker (`truncateTextTokens`); user text and tool one-liners stay head-only | coding-agent conclusions sit at the END of assistant messages; head-only cut them off (real-session profile: 6/55 blocks, ~6.5K tokenizer tokens of tails dropped). User text keeps head-only (0/9 over budget in the profile; keeps V1 aligned) |
+| — (no upstream vector) | identical one-liners merge only when ADJACENT; merged refs drop `-> result` pointers | repeats merge CHECKPOINT-WIDE into their LAST occurrence (last-wins; runs before the per-message cap so only distinct rows count against it); refs keep EVERY member call seq, and result pointers survive for the last member plus any failed result; segment headers left headless by drops are re-attached to the next surviving entry | real session: 26 of 33 repeated rows were cross-segment, so adjacency catches almost nothing there; global last-wins leaves 0 blind tool results on the profiled session (137 directly pointed + 15 superseded duplicates reachable via their surviving call rows) |
 
 ### Reference conventions (both use the same semantics, different index spaces)
 - `(#N)` = pi conversation message index vs `(seq N)` = durable DSH event seq;

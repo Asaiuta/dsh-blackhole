@@ -192,6 +192,16 @@ export function buildReplacementHistory(
 export function dshMessageToResponseItems(message: Message): ResponseItem[] {
   const items: ResponseItem[] = []
 
+  if (message.role === 'tool') {
+    // rc.2 promotes tool results to first-class tool-role messages carrying
+    // the answered call id on the message itself.
+    return [{
+      type: 'function_call_output',
+      call_id: String(message.toolCallId).split('|', 1)[0],
+      output: contentBlocksToOutput(message.content),
+    }]
+  }
+
   if (message.role === 'user' || message.role === 'system') {
     const contentItems: ResponseContentItem[] = []
     const toolOutputs: ResponseItem[] = []
@@ -205,15 +215,22 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
           // cannot resolve them here, so the visit is recorded as text.
           contentItems.push({ type: 'input_text', text: IMAGE_CONTENT_OMITTED_PLACEHOLDER })
           break
-        case 'tool-result':
+        case 'file':
+          contentItems.push({ type: 'input_text', text: fileBlockLabel(block) })
+          break
+        default: {
+          // Legacy revisions stored tool results as a free-form leading
+          // `tool-result` block on the user turn; rc.2 promotes them to the
+          // tool-role branch above. Keep the legacy path off the narrowed
+          // union through an explicit structural check.
+          const legacy = block as unknown as { type?: string; toolCallId?: unknown; content?: readonly ContentBlock[] }
+          if (legacy.type !== 'tool-result') break
           toolOutputs.push({
             type: 'function_call_output',
-            call_id: String(block.toolCallId).split('|', 1)[0],
-            output: toolResultBlockToOutput(block.content),
+            call_id: String(legacy.toolCallId ?? '').split('|', 1)[0],
+            output: contentBlocksToOutput(legacy.content ?? []),
           })
-          break
-        default:
-          break
+        }
       }
     }
     if (contentItems.length > 0) {
@@ -267,11 +284,24 @@ export function dshMessageToResponseItems(message: Message): ResponseItem[] {
   return items
 }
 
-function toolResultBlockToOutput(content: readonly ContentBlock[]): string {
+/** Best-effort label for an attachment-owned file block. */
+function fileBlockLabel(block: ContentBlock): string {
+  const attachment = (block as unknown as { attachment?: Record<string, unknown> }).attachment
+  if (attachment !== undefined && typeof attachment === 'object') {
+    for (const key of ['name', 'filename', 'path', 'mediaType'] as const) {
+      const value = attachment[key]
+      if (typeof value === 'string' && value.length > 0) return `[file: ${value}]`
+    }
+  }
+  return '[file]'
+}
+
+function contentBlocksToOutput(content: readonly ContentBlock[]): string {
   return content
     .map((block) => {
       if (block.type === 'text') return block.text
       if (block.type === 'image') return '[image]'
+      if (block.type === 'file') return fileBlockLabel(block)
       return `[${String(block.type)}]`
     })
     .filter(Boolean)
@@ -307,7 +337,12 @@ export function reconstructRemoteCompactionHistory(params: {
   const trailing: ResponseItem[] = []
   let pending: ResponseItem[] = []
   for (const message of params.trailingMessages) {
-    if (message.source.kind === 'plugin' && message.source.plugin === 'compact') continue
+    // Compaction checkpoints are previous summaries, not fresh transcript.
+    // rc.2 registers the `compact-checkpoint` source kind; the legacy
+    // free-form marker stays for older harness revisions.
+    if (message.source.kind === 'compact-checkpoint') continue
+    const legacySource = message.source as unknown as { kind?: string; plugin?: string }
+    if (legacySource.kind === 'plugin' && legacySource.plugin === 'compact') continue
     const items = dshMessageToResponseItems(message)
     if (items.length === 0) continue
     if (message.role === 'assistant') {

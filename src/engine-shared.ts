@@ -177,7 +177,11 @@ export async function summarizeWithLlm(
   const assembler = new BlockAssembler()
   const messages = [...input.messages, createUserMessage({
     content: [{ type: 'text', text: COMPACTION_INSTRUCTION }],
-    source: { kind: 'plugin', plugin: 'dsh-blackhole' },
+    // Source kinds are merge-extensible — each producer registers its own via
+    // module augmentation. This label is request-only (never appended to the
+    // durable log), so keep the official backend's free-form `plugin` shape,
+    // narrowed through unknown for the stricter rc.2 type union.
+    source: { kind: 'plugin', plugin: 'dsh-blackhole' } as unknown as Message['source'],
   })]
   const options = {
     provider: target.provider,

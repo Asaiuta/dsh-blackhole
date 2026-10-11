@@ -72,6 +72,7 @@ export {
   stripNoiseXml,
   stripSelfTalkPrefix,
   tokenize,
+  truncateTextTokens,
   truncateTokens,
 } from './instant.ts'
 export type {
@@ -101,15 +102,21 @@ export type {
 } from './blackhole-summary.ts'
 // Runtime-independent recall/search core and dsh-tools-compatible registry seam.
 export {
+  adaptRecallSession,
   createRecallTool,
   indexRecallSession,
+  isOmMemoryId,
+  OM_RECALL_TODO,
   rankRecallEntries,
   recallSession,
   registerRecallTool,
 } from './recall.ts'
 export type {
+  RecallDrillDown,
   RecallEntry,
   RecallEvent,
+  RecallFileMatch,
+  RecallFileOperation,
   RecallMode,
   RecallQuery,
   RecallResult,
@@ -118,6 +125,54 @@ export type {
   RecallToolDefinition,
   RecallToolRegistry,
 } from './recall.ts'
+export {
+  extractRecallFileOperations,
+  findRecallFileMatches,
+  parseRecallDrillDown,
+  recallFileSearchText,
+  renderRecallFileDrillDown,
+} from './recall-files.ts'
+export {
+  createRecallCommand,
+  parseRecallCommandInput,
+  RECALL_COMMAND_NAME,
+  registerRecallCommand,
+} from './recall-command.ts'
+export type {
+  RecallCommandDefinition,
+  RecallCommandInvocation,
+  RecallCommandRegistry,
+  RecallCommandResult,
+} from './recall-command.ts'
+// Runtime compaction-mode command adapter (late-bound dsh-commands surface).
+export {
+  createModeCommand,
+  MODE_COMMAND_NAME,
+  parseModeCommandInput,
+  registerModeCommand,
+  clearRuntimeModeOverride,
+  loadRuntimeModeOverride,
+  saveRuntimeModeOverride,
+  runtimeModeFilePath,
+  RUNTIME_MODE_FILE,
+} from './mode-command.ts'
+export type {
+  BlackholeModeController,
+  ModeCommandDefinition,
+  ModeCommandInvocation,
+  ModeCommandRegistry,
+  ModeCommandResult,
+  RuntimeModeOverride,
+} from './mode-command.ts'
+// Compatible session event-log access (runtime Session vs. test fakes).
+export {
+  deriveSessionMessage,
+  readSessionEvents,
+} from './session-access.ts'
+export type {
+  SessionEventLike,
+  SessionEventSource,
+} from './session-access.ts'
 // Protocol layer, re-exported for downstream consumers (replay tooling, tests).
 export {
   buildCompactionRequestBody,

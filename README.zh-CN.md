@@ -34,6 +34,62 @@
 
 引擎继承官方 `BasicCompactionEngine`,所有压力 / 保留 / 策略旋钮、token 计费定价、上下文溢出恢复都与上游完全一致。
 
+## Recall 与文件恢复
+
+本插件提供接近 pi-blackhole 的 `recall` 能力。检测到可选的
+`dsh-tools` 服务后会自动注册；检测到 `dsh-commands` 后还会注册可选的
+`/blackhole-recall` 人工命令。这两个包都不是硬依赖。它们读取 DSH 的无损
+内存事件日志和原始工具调用参数，因此本地或远程压缩后仍能工作，不依赖
+pi 的 JSONL 会话文件。
+
+典型的工具参数：
+
+```json
+{
+  "query": "SecretNeedle",
+  "mode": "hybrid",
+  "scope": "lineage",
+  "page": 1,
+  "limit": 5
+}
+```
+
+交互式命令写法相同：
+
+```text
+/blackhole-recall SecretNeedle mode:hybrid scope:lineage page:1 limit:5
+```
+
+支持的召回形式：
+
+| 形式 | 结果 |
+|---|---|
+| 文本（`parser`）或正则（`/parser/i`、`hook|inject`） | 排序后的会话搜索；hybrid 模式还会搜索有界的 Write/Edit 内容 |
+| `#N` | 精确展开持久事件 `N`；在 50 KB 响应上限内完整恢复正文和工具结果，文件正文仍以路径引用 |
+| `#N:path` 或 `#N:file` | 预览一个文件操作；条目只有一个文件时可自动选择 |
+| `#N:path:full` | 返回完整操作内容，单次显示上限 50 KB |
+| `#N:path:offset` / `#N:path:offset:limit` | 从 0 开始的行分页（`limit` 默认 30） |
+| `mode:file` | 只搜索包含文件内容操作的条目 |
+| `mode:touched` | 列出含正文的 Write/Edit 类操作路径及其持久序号（默认每页 5 个路径） |
+| `scope:all` | 包含活动 lineage 之外的事件（默认只查活动 lineage） |
+| `expand: [N, ...]` | 即使查询不匹配，也强制把最多 50 个指定条目加入结果页 |
+
+Write/Edit 提取支持 `content`、`edits`、`oldText`、`newText` 以及常见路径
+字段。普通排序结果会把正文块裁到约 300 字符、工具结果裁到约 200 字符；
+`#N` 恢复完整正文和工具结果，但文件参数仍为摘要，文件正文只通过
+`#N:path` 获取。索引阶段每个文件操作最多取 10 KB；包括精确展开和 offset
+分页在内的每次 recall 响应均限制为 50 KB。搜索/文件列表的 `limit` 最多
+100 项，显式展开最多 50 项。危险、过长或容易产生回溯阻塞的正则会降级为
+普通 token 搜索。路径有歧义时会列出候选路径，不会静默猜选。精确的 12 位
+小写十六进制查询保留给 OM ID，并返回明确的联动提示。
+
+这与 pi-blackhole 的会话/文件 recall 已较为接近，但还不是完整 OM 实现：
+OM observation/reflection ledger、OM ID 查找，以及从 OM 记录自动反向召回
+仍列为 TODO。VCC 风格摘要与 recall 当前通过 DSH 持久序号关联，而不是通过
+OM memory ID 关联。`scope:all` 始终只作用于当前 DSH session，不会加载兄弟
+fork/session 的日志。Stock DSH session 当前不提供可选的 `lineageSeqs`
+投影，因此只有宿主提供该投影时，`lineage` 与 `all` 才会产生区别。
+
 ## 安装
 
 需要 DSH `0.1.0-rc.6`(web 或 headless profile)。
@@ -160,6 +216,7 @@ pnpm run build       # esbuild → lib/index.js
 node tests/smoke-load.mjs      # loader 组合挂载引擎
 node tests/protocol-smoke.mjs  # 转换/SSE/回环(本地 fake endpoint)
 node tests/hybrid-smoke.mjs    # 编译器单元 + 路由(remote/instant/llm/compat)
+node tests/recall.mjs          # 会话/文件 recall + 可选命令/工具接缝
 node tests/equivalence/build-algal.mjs && node tests/equivalence/differential.mjs
                                # 与真实上游 bundle 的协议等价
 node tests/equivalence/build-blackhole.mjs && node tests/equivalence/differential-brief.mjs

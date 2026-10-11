@@ -112,7 +112,7 @@ const stripRefs = (text) => text
   .replace(/\(seq [^)]*\)/g, '')                        // dsh seq refs incl. -> result
   .replace(/^\[(user|assistant|system)\]$/gm, '')       // bare role headers
   .replace(/^\[(user|assistant|system)\]\n/gm, '')      // inline role headers
-  .replace(/^\s*\* \(\d+ earlier tool-call entries omitted\)\s*$/gm, '')
+  .replace(/^\s*\* \(\d+ earlier tool-call entries omitted(?:: seq -?\d+)?\)\s*$/gm, '')
   .replace(/^\s+|\s+$/gm, '')                            // per-line whitespace
   .replace(/\n{3,}/g, '\n\n')
   .trim()

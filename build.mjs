@@ -10,8 +10,8 @@ import { mkdirSync } from 'node:fs'
 mkdirSync('lib', { recursive: true })
 
 await build({
-  entryPoints: ['src/index.ts'],
-  outfile: 'lib/index.js',
+  entryPoints: ['src/index.ts', 'src/commands-plugin.ts', 'src/tools-plugin.ts'],
+  outdir: 'lib',
   bundle: true,
   format: 'esm',
   platform: 'node',

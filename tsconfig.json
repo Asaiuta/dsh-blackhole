@@ -13,7 +13,11 @@
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/cosmokit": ["node_modules/@deepseek-ai/cosmokit/lib/index.d.ts"]
+    }
   },
   "include": ["src"]
 }
