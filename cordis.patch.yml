@@ -19,8 +19,12 @@
 #
 # 规范依据：patch 带 id 且无 insert 时，**config 整体替换、不做深合并**，
 # 所以 [2] 必须完整重述官方 plugins 列表。
-# 基线：@deepseek-ai/dsh-web-app@0.2.0-rc.2 / presets/standard.patch.yml
-#   —— web-app 升级后若该列表变动，需要重新对齐（其余行不动，只同步新增/删除项）。
+# 基线：@deepseek-ai/dsh-web-app@0.2.1-alpha.2 / presets/standard.patch.yml
+#   —— 2026-10-16 已按该基线重新对齐：新增 time-context / tool-schedule 行；
+#      同步 plan-mode 文案与 tool-subagent(-fork) 的 toolFilter；删除基线已移除的
+#      tool-subagent-codex / tool-subagent-claude-code / tool-ralph 行，
+#      以及新版 dsh-tool-subagent 已不存在的 backgroundMode 字段。
+#      web-app 升级后若该列表再变动，按同规则重新对齐（其余行不动，只同步新增/删除项）。
 # 在不存在 preset-standard 行的 profile 上，[2] 只会产生一条 "not found" 警告后被跳过，
 # 不会导致加载失败。
 
@@ -42,7 +46,9 @@
 # 重新打开，与 preset 组内那份重复注册。0.2 下 host 层不该有 compaction 消费者。
 
 # ──────────────────────── [2] preset plane ────────────────────────
-# 覆盖 preset-standard：唯一改动是组内 compaction-basic 的后端换成 dsh-blackhole。
+# 覆盖 preset-standard：组内 compaction-basic 的后端换成 dsh-blackhole（并加挂
+# blackhole-commands / blackhole-tools 两个单元、隔离 responsesCompactionReplay）；
+# 其余行与当前官方基线（0.2.1-alpha.2）对齐。
 
 - id: preset-standard
   name: '@deepseek-ai/dsh-agent-preset'
@@ -53,12 +59,14 @@
       - id: persona
         name: '@deepseek-ai/dsh-persona'
         config:
-          suffix: Your working directory is {{cwd}}.
+          # {{cwd}} 在当前版本已不存在（loop 只注册 provider/model）；工作目录由 dsh-working-directory 自动注入。
           prefix: You are a coding agent powered by the {{model}} model.
       - id: agent-instructions
         name: '@deepseek-ai/dsh-agent-instructions'
         config:
           maxBytes: 65536
+      - id: time-context
+        name: '@deepseek-ai/dsh-time-context'
       - id: tool-bash
         name: '@deepseek-ai/dsh-tool-bash'
         disabled: !!js process.platform === 'win32'
@@ -73,6 +81,8 @@
           sampleOverCapGlobResults: false
       - id: tool-jobs
         name: '@deepseek-ai/dsh-tool-jobs'
+      - id: tool-schedule
+        name: '@deepseek-ai/dsh-tool-schedule'
       - id: skill-filesystem
         name: '@deepseek-ai/dsh-skill-filesystem'
       - id: tool-skill
@@ -91,7 +101,7 @@
             name: '@deepseek-ai/dsh-plan-mode'
             config:
               section: |
-                You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+                You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
 
                 Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
 
@@ -152,41 +162,29 @@
               provider: spawn
               toolName: subagent
               modelSelectionSettings: true
-              backgroundMode: continuable
+              toolFilter:
+                deny:
+                  - schedule_create
+                  - schedule_delete
+                  - schedule_list
+                  - schedule_update
           - id: tool-subagent-fork
             name: '@deepseek-ai/dsh-tool-subagent'
             config:
               provider: fork
               toolName: subagent_fork
-              backgroundMode: continuable
-          - id: tool-subagent-codex
-            name: '@deepseek-ai/dsh-tool-subagent'
-            disabled: true
-            config:
-              provider: codex
-              toolName: subagent_codex
-              backgroundMode: one-shot
-              maxDepth: provider-managed
-          - id: tool-subagent-claude-code
-            name: '@deepseek-ai/dsh-tool-subagent'
-            disabled: true
-            config:
-              provider: claude-code
-              toolName: subagent_claude_code
-              backgroundMode: one-shot
-              maxDepth: provider-managed
+              toolFilter:
+                deny:
+                  - schedule_create
+                  - schedule_delete
+                  - schedule_list
+                  - schedule_update
           - id: workflow-ptc
             name: '@deepseek-ai/dsh-workflow-ptc'
             config:
               provider: spawn
           - id: tool-workflow
             name: '@deepseek-ai/dsh-tool-workflow'
-          - id: tool-ralph
-            name: '@deepseek-ai/dsh-tool-ralph'
-            disabled: true
-            config:
-              subagentProvider: spawn
-              maxRounds: 64
       - id: tool-ask-user
         name: '@deepseek-ai/dsh-tool-ask-user'
       - id: tool-todo
